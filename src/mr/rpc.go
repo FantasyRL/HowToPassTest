@@ -6,24 +6,36 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
+type BaseMsg struct {
+	Code int //200 Success 400NoWork
+	Msg  string
 }
 
-type ExampleReply struct {
-	Y int
+type RPCArgs struct {
+	Status int //0接任务 1完成任务
+	//0 param
+	WorkerNum int
+	//1 param
+	WorkSerial int
+}
+
+type RPCReply struct {
+	FileName   string
+	WorkSerial int
+	BaseMsg    *BaseMsg
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
@@ -33,4 +45,8 @@ func coordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
+}
+
+func NewBaseMsg(code int, Msg string) *BaseMsg {
+	return &BaseMsg{Code: code, Msg: Msg}
 }
