@@ -27,15 +27,19 @@ type RPCArgs struct {
 	//0 param
 	WorkerNum int
 	//1 param
-	WorkSerial   int
-	Intermediate *[]KeyValue
+	WorkSerial int
+	NSerial    int
+	//Intermediate *[]KeyValue
 }
 
 type RPCReply struct {
 	FileName     string
 	WorkSerial   int
-	BaseMsg      *BaseMsg //200Map 300Reduce 400Done
-	Intermediate *[]KeyValue
+	BaseMsg      *BaseMsg //200Map 300Reduce 400Done 500wait
+	NReduceCount int
+	NSerial      int //nReduce serial
+	WorkCount    int
+	//Intermediate *[]KeyValue
 }
 
 // Add your RPC definitions here.

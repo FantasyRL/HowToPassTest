@@ -23,7 +23,7 @@ type Coordinator struct {
 
 	ReducePointer int
 	ReduceStatus  []int
-	Intermediates []*[]KeyValue
+	NReduceCount  int
 
 	Workers []*WorkerArgs //记录是哪个worker
 
@@ -32,6 +32,7 @@ type WorkerArgs struct {
 	WorkerNum int //worker编号
 	//FileName      string//这是不必要的
 	WorkSerial    int //文件编号
+	NSerial       int
 	HeartBeatChan chan bool
 	Stage         int //1Map 2Reduce
 }
@@ -52,7 +53,6 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 
 	var mu sync.Mutex
 	mu.Lock()
-
 	switch args.Status {
 	case 0: //初次
 		if c.MapPointer != c.TotalFileNum-1 {
@@ -68,11 +68,14 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				}
 			}
 			if !isExistTodoFlag {
-				reply.BaseMsg = NewBaseMsg(400, "")
+				reply.BaseMsg = NewBaseMsg(500, "")
 				break
 			}
 			reply.BaseMsg = NewBaseMsg(200, "")
 			reply.FileName = c.FileNames[reply.WorkSerial]
+			reply.NReduceCount = c.NReduceCount
+			reply.WorkCount = c.TotalFileNum
+
 			workerArgs := &WorkerArgs{
 				WorkerNum:  args.WorkerNum,
 				WorkSerial: reply.WorkSerial,
@@ -82,44 +85,55 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			workerArgs.HeartBeatChan = make(chan bool)
 			c.Workers = append(c.Workers, workerArgs)
 			//mu.Unlock()
-
 			go workerArgs.HeartbeatCheck()
 
-		} else if c.ReducePointer != (c.TotalFileNum-1) && c.MapPointer == (c.TotalFileNum-1) {
+		} else if c.ReducePointer != c.NReduceCount-1 {
 			//reduce work
-			reply.BaseMsg = NewBaseMsg(300, "")
-
-			for i := c.ReducePointer; i < c.TotalFileNum; i++ { //assign reduce work
+			isExistTodoFlag := false
+			for i := c.ReducePointer; i < c.NReduceCount; i++ {
 				if c.ReduceStatus[i] == 0 {
-					reply.WorkSerial = i
+					isExistTodoFlag = true
+				} //assign reduce work
+				if c.ReduceStatus[i] == 0 {
+					reply.NSerial = i
 					c.ReduceStatus[i] = 1
 					break
 				}
 			}
-			//reply.Intermediate = c.Intermediates[reply.WorkSerial]
+			if !isExistTodoFlag {
+				reply.BaseMsg = NewBaseMsg(500, "")
+				break
+			}
+
+			reply.BaseMsg = NewBaseMsg(300, "")
+			reply.NReduceCount = c.NReduceCount
+			reply.WorkCount = c.TotalFileNum
 
 			workerArgs := &WorkerArgs{
-				WorkerNum:  args.WorkerNum,
-				WorkSerial: reply.WorkSerial,
-				Stage:      2,
+				WorkerNum: args.WorkerNum,
+				NSerial:   reply.NSerial,
+				Stage:     2,
 			}
 			workerArgs.HeartBeatChan = make(chan bool)
 			c.Workers = append(c.Workers, workerArgs)
 			mu.Unlock()
 			go workerArgs.HeartbeatCheck()
-		} else if c.ReducePointer == c.TotalFileNum-1 {
-			//todo:done
+		} else if c.ReducePointer == c.NReduceCount-1 {
+			reply.BaseMsg = NewBaseMsg(400, "")
 		} else {
-			reply.BaseMsg = NewBaseMsg(400, "") //wait
+			reply.BaseMsg = NewBaseMsg(500, "") //wait
 		}
 	case 1: //完成后再次
 		if args.Stage == 1 {
-			c.MapStatus[args.WorkSerial] = 2
-			//c.Intermediates[args.WorkSerial] = args.Intermediate
-			fmt.Printf("map %v done\n", args.WorkSerial)
+			if c.MapStatus[args.WorkSerial] != 2 {
+				c.MapStatus[args.WorkSerial] = 2
+				fmt.Printf("map %v done\n", args.WorkSerial)
+			}
 		} else {
-			c.ReduceStatus[args.WorkSerial] = 2
-			fmt.Printf("reduce %v done\n", args.WorkSerial)
+			if c.ReduceStatus[args.NSerial] != 2 {
+				c.ReduceStatus[args.NSerial] = 2
+				fmt.Printf("reduce %v done\n", args.NSerial)
+			}
 		}
 
 		if c.MapPointer != c.TotalFileNum-1 {
@@ -136,47 +150,50 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				}
 			}
 			if !isExistTodoFlag {
-				reply.BaseMsg = NewBaseMsg(400, "")
+				reply.BaseMsg = NewBaseMsg(500, "")
 				break
 			}
 			reply.FileName = c.FileNames[reply.WorkSerial]
+			reply.NReduceCount = c.NReduceCount
+			reply.WorkCount = c.TotalFileNum
 
 			for _, worker := range c.Workers {
 				if args.WorkerNum == worker.WorkerNum {
 					worker.WorkSerial = reply.WorkSerial
 					worker.Stage = 1
-					//worker.FileName = c.FileNames[reply.WorkSerial]
 				}
 				reply.BaseMsg = NewBaseMsg(200, "")
 			}
-
-			//workerArgs.HeartBeatChan = make(chan bool)
-			//c.Workers = append(c.Workers, workerArgs)
-			//mu.Unlock()
-
-			//go workerArgs.HeartbeatCheck()
-
-		} else if c.ReducePointer != (c.TotalFileNum-1) && c.MapPointer == (c.TotalFileNum-1) {
-			for i := c.ReducePointer; i < c.TotalFileNum; i++ { //assign reduce work
+		} else if c.ReducePointer != c.NReduceCount-1 {
+			isExistTodoFlag := false
+			for i := c.ReducePointer; i < c.NReduceCount; i++ {
 				if c.ReduceStatus[i] == 0 {
-					reply.WorkSerial = i
+					isExistTodoFlag = true
+				} //assign reduce work
+				if c.ReduceStatus[i] == 0 {
+					reply.NSerial = i
 					c.ReduceStatus[i] = 1
 					break
 				}
 			}
-			//reply.Intermediate = c.Intermediates[reply.WorkSerial]
+			if !isExistTodoFlag {
+				reply.BaseMsg = NewBaseMsg(500, "")
+				break
+			}
+			reply.NReduceCount = c.NReduceCount
+			reply.WorkCount = c.TotalFileNum
+
 			for _, worker := range c.Workers {
 				if args.WorkerNum == worker.WorkerNum {
-					worker.WorkSerial = reply.WorkSerial
+					worker.NSerial = reply.NSerial
 					worker.Stage = 2
-					//worker.FileName = c.FileNames[reply.WorkSerial]
 				}
 				reply.BaseMsg = NewBaseMsg(300, "")
 			}
-		} else if c.ReducePointer == c.TotalFileNum-1 {
-			//todo:done
+		} else if c.ReducePointer == c.NReduceCount-1 {
+			reply.BaseMsg = NewBaseMsg(400, "")
 		} else {
-			reply.BaseMsg = NewBaseMsg(400, "") //wait
+			reply.BaseMsg = NewBaseMsg(500, "") //wait
 		}
 	}
 	//mu.Lock()
@@ -188,15 +205,22 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				break
 			}
 		}
-	} else if c.ReducePointer != c.TotalFileNum-1 {
-		for i := 0; i < c.TotalFileNum; i++ {
+		if c.MapStatus[c.TotalFileNum-1] == 2 && c.MapPointer == c.TotalFileNum-2 {
+			c.MapPointer = c.TotalFileNum - 1
+		}
+	} else if c.ReducePointer != c.NReduceCount-1 {
+		for i := 0; i < c.NReduceCount; i++ {
 			if c.ReduceStatus[i] != 2 {
 				c.ReducePointer = i
 				break
 			}
 		}
+		if c.ReduceStatus[c.NReduceCount-1] == 2 && c.ReducePointer == c.NReduceCount-2 {
+			c.ReducePointer = c.NReduceCount - 1
+		}
 	}
 	mu.Unlock()
+
 	return nil
 }
 
@@ -251,13 +275,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		//Stage:        0,
 		MapPointer:    0,
 		ReducePointer: 0,
-		ReduceStatus:  make([]int, len(files)),
-		Intermediates: make([]*[]KeyValue, len(files)),
+		ReduceStatus:  make([]int, nReduce),
+		NReduceCount:  nReduce,
 	}
 	for i := 0; i < len(files); i++ {
 		c.MapStatus[i] = 0
 		c.ReduceStatus[i] = 0
-		c.Intermediates[i] = nil
+	}
+	for i := len(files); i < nReduce; i++ {
+		c.ReduceStatus[i] = 0
 	}
 
 	DeregisterChan = make(chan *WorkerArgs)
@@ -285,7 +311,7 @@ func (c *Coordinator) DeRegister() {
 	for {
 		select {
 		case t := <-DeregisterChan:
-			if t.WorkSerial != -1 {
+			if t.WorkSerial != -1 && c.ReducePointer != c.NReduceCount-1 {
 				var mu sync.Mutex
 				mu.Lock()
 				switch t.Stage {
@@ -293,8 +319,8 @@ func (c *Coordinator) DeRegister() {
 					log.Printf("%v dead,map work %v release", t.WorkerNum, t.WorkSerial)
 					c.MapStatus[t.WorkSerial] = 0
 				case 2:
-					log.Printf("%v dead,reduce work %v release", t.WorkerNum, t.WorkSerial)
-					c.ReduceStatus[t.WorkSerial] = 0
+					log.Printf("%v dead,reduce work %v release", t.WorkerNum, t.NSerial)
+					c.ReduceStatus[t.NSerial] = 0
 				}
 				mu.Unlock()
 			} else {

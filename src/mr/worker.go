@@ -40,27 +40,28 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	workerNum := rand2.Int()
 	// Your worker implementation here.
 	args := RPCArgs{
-		//Status:    0,
+		Status:    0,
 		WorkerNum: workerNum,
 	}
 
 	//发送args 接收reply
 	reply := RPCReply{}
+	go SendHeartbeat(workerNum)
 	for {
 		ok := call("Coordinator.Worker", &args, &reply)
 		if ok {
-			go SendHeartbeat(workerNum)
 			switch reply.BaseMsg.Code {
 			case 200:
-				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, mapf, reducef)
+				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, reply.NReduceCount, mapf, reducef)
 				break
 			case 300:
-				//fmt.Println(*reply.Intermediate)
-				Reduce(args.WorkerNum, reply.WorkSerial, reducef)
+				Reduce(args.WorkerNum, reply.WorkCount, reply.NReduceCount, reducef)
 				break
-			case 400:
+			case 500:
 				time.Sleep(time.Second)
 				continue
+			case 400:
+				os.Exit(0)
 			}
 		} else {
 			fmt.Printf("call failed!\n")
@@ -74,6 +75,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	//<-forever
 }
 func SendHeartbeat(workerNum int) {
+	time.Sleep(time.Second * 2)
 	ticker := time.NewTicker(time.Second * 3)
 	defer ticker.Stop()
 	for {
@@ -90,54 +92,64 @@ func SendHeartbeat(workerNum int) {
 		}
 	}
 }
-func SendMapDoneMsg(workerNum int, workSerial int, intermediate *[]KeyValue,
+func SendMapDoneMsg(workerNum int, workSerial int,
 	mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	args := RPCArgs{
-		Status:       1,
-		WorkerNum:    workerNum,
-		WorkSerial:   workSerial,
-		Intermediate: intermediate,
-		Stage:        1,
-	}
-	reply := RPCReply{}
-	for {
-
-		ok := call("Coordinator.Worker", &args, &reply)
-		if ok {
-			switch reply.BaseMsg.Code {
-			case 200:
-				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, mapf, reducef)
-				break
-			case 300:
-				Reduce(args.WorkerNum, reply.WorkSerial, reducef)
-				break
-			case 400:
-				time.Sleep(time.Second)
-				continue
-			}
-		}
-		time.Sleep(time.Second * 1)
-	}
-
-}
-func SendReduceDoneMsg(workerNum int, workSerial int,
-	reducef func(string, []string) string) {
 	args := RPCArgs{
 		Status:     1,
 		WorkerNum:  workerNum,
 		WorkSerial: workSerial,
-		Stage:      2,
+		//Intermediate: intermediate,
+		Stage: 1,
 	}
 	reply := RPCReply{}
-	ok := call("Coordinator.Worker", &args, &reply)
-	if ok {
-		switch reply.BaseMsg.Code {
-		//no 200 此时已无Map任务
-		case 300:
-			Reduce(args.WorkerNum, reply.WorkSerial, reducef)
-		case 400:
-			log.Println("nothing to do")
-			os.Exit(0)
+	for {
+		ok := call("Coordinator.Worker", &args, &reply)
+		if ok {
+			switch reply.BaseMsg.Code {
+			case 200:
+				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, reply.NReduceCount, mapf, reducef)
+				break
+			case 300:
+				Reduce(args.WorkerNum, reply.WorkCount, reply.NSerial, reducef)
+				break
+			case 500:
+				time.Sleep(time.Second)
+				continue
+			case 400:
+				os.Exit(0)
+			}
+		} else {
+			fmt.Printf("call failed!\n")
+			break
+		}
+	}
+
+}
+func SendReduceDoneMsg(workerNum int, nSerial int,
+	reducef func(string, []string) string) {
+	args := RPCArgs{
+		Status:    1,
+		WorkerNum: workerNum,
+		NSerial:   nSerial,
+		Stage:     2,
+	}
+	reply := RPCReply{}
+	for {
+		ok := call("Coordinator.Worker", &args, &reply)
+		if ok {
+			switch reply.BaseMsg.Code {
+			//no 200 此时已无Map任务
+			case 300:
+				Reduce(args.WorkerNum, reply.WorkCount, reply.NSerial, reducef)
+			case 500:
+				time.Sleep(time.Second)
+				continue
+			case 400:
+				os.Exit(0)
+			}
+		} else {
+			fmt.Printf("call failed!\n")
+			break
 		}
 	}
 }
@@ -190,13 +202,13 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func Map(fileName string, workerNum int, workSerial int,
+func Map(fileName string, workerNum int, workSerial int, nReduceCount int,
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	//单体式直接把Map后的中间结果临时保存在了一个切片内，但是分布式显然
 	//不能这么做，分布式系统通过Map产生的中间结果一定不能相互干扰
-	intermediate := []KeyValue{}
+	//intermediate := []KeyValue{}
 	// 对txt文件进行Map，将获得的key value 切片合并
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -207,48 +219,57 @@ func Map(fileName string, workerNum int, workSerial int,
 		log.Fatalf("cannot read %v", fileName)
 	}
 	file.Close()
-	kva := mapf(fileName, string(content))      //Map 函数生成一组中间结果（键值对）
-	intermediate = append(intermediate, kva...) //一个txt文件的key value
-	sort.Sort(ByKey(intermediate))              //通过规则进行sort
+	kva := mapf(fileName, string(content)) //Map 函数生成一组中间结果（键值对）
 
-	//不是很懂mr-X-Y代表的什么
-	tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(workSerial)))}, "-")
-	tmpFile, _ := os.Create(tmpName)
-	enc := json.NewEncoder(tmpFile)
-	for _, kv := range intermediate {
-		err := enc.Encode(&kv)
-		if err != nil {
-			log.Fatal("map create tmp file error")
+	//nReduce
+	//intermediate = append(intermediate, kva...) //一个txt文件的key value
+	// 按照key，也就是单词进行排序，将相同的单词聚集在一起
+	sort.Sort(ByKey(kva))
+	//nowPointer:=0
+	fmt.Println(nReduceCount, len(kva))
+	for i := 0; i < nReduceCount; i++ {
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(i)))}, "-")
+		tmpFile, _ := os.Create(tmpName)
+		enc := json.NewEncoder(tmpFile)
+		for j := i * (len(kva)/nReduceCount + 1); j < (i+1)*(len(kva)/nReduceCount+1) && j < len(kva); j++ {
+			err := enc.Encode(&kva[j])
+			if err != nil {
+				log.Fatal("map create tmp file error")
+			}
 		}
+		tmpFile.Close()
 	}
 
-	SendMapDoneMsg(workerNum, workSerial, &intermediate, mapf, reducef)
+	SendMapDoneMsg(workerNum, workSerial, mapf, reducef)
 
 }
 
-func Reduce(workerNum int, workSerial int, reducef func(string, []string) string) {
-	kva := []KeyValue{}
+func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) string) {
 	//reduce
 	//每个 Reduce 函数接收来自 Map 步骤的中间结果，并进行汇总、聚合或其他计算。
 	//Reduce 函数生成最终的输出结果。
 	//intermediate := []KeyValue{} //tmp
-	tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(workSerial)))}, "-")
-	tmpFile, _ := os.Open(tmpName)
-	dec := json.NewDecoder(tmpFile)
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err != nil {
-			break
+	kva := make([]KeyValue, 0)
+	for i := 0; i < workCount; i++ {
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(ihash(strconv.Itoa(n)))}, "-")
+		tmpFile, _ := os.Open(tmpName)
+		dec := json.NewDecoder(tmpFile)
+		defer tmpFile.Close()
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
 		}
-		kva = append(kva, kv)
+		os.Remove(tmpName)
 	}
-	tmpFile.Close()
-	os.Remove(tmpName)
 
 	i := 0
 	//单体式通过一个比较巧妙的循环分割了reduce任务，分布式的reduce任务又应该怎么划分？
-	oname := strings.Join([]string{"mr", "out", strconv.Itoa(workSerial)}, "-")
+	oname := strings.Join([]string{"mr", "out", strconv.Itoa(n)}, "-")
 	ofile, _ := os.Create(oname)
+	defer ofile.Close()
 	for i < len(kva) {
 		// 对相同的单词进行计数，保存到values切片，再进行Reduce
 		j := i + 1
@@ -266,6 +287,6 @@ func Reduce(workerNum int, workSerial int, reducef func(string, []string) string
 		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 		i = j
 	}
-	ofile.Close()
-	SendReduceDoneMsg(workerNum, workSerial, reducef)
+
+	SendReduceDoneMsg(workerNum, n, reducef)
 }
