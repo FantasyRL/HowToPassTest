@@ -22,17 +22,20 @@ type BaseMsg struct {
 }
 
 type RPCArgs struct {
-	Status int //0接任务 1完成任务
+	Status int //0接任务 1完成
+	Stage  int //1Map 2Reduce
 	//0 param
 	WorkerNum int
 	//1 param
-	WorkSerial int
+	WorkSerial   int
+	Intermediate *[]KeyValue
 }
 
 type RPCReply struct {
-	FileName   string
-	WorkSerial int
-	BaseMsg    *BaseMsg
+	FileName     string
+	WorkSerial   int
+	BaseMsg      *BaseMsg //200Map 300Reduce 400Done
+	Intermediate *[]KeyValue
 }
 
 // Add your RPC definitions here.
