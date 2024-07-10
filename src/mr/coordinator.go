@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -44,7 +45,8 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 
 	//pointer指向目前连续已完成文件的最后一个文件(为了失败补救)
 	for i := 0; i < c.TotalFileNum; i++ {
-		if c.FileStatus[c.TotalFileNum] != 2 {
+		fmt.Println(c.FileStatus[i])
+		if c.FileStatus[i] != 2 {
 			c.Pointer = i
 			break
 		}
@@ -56,8 +58,8 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			var mu sync.Mutex
 			mu.Lock()
 			reply.BaseMsg = NewBaseMsg(200, "success to assign")
-			for i := c.Pointer; i < c.TotalFileNum; i++ {
-				if c.FileStatus[c.TotalFileNum] == 0 {
+			for i := c.Pointer; i < c.TotalFileNum; i++ { //assign map work
+				if c.FileStatus[i] == 0 {
 					reply.WorkSerial = i
 					break
 				}
@@ -65,8 +67,8 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			reply.FileName = c.FileNames[reply.WorkSerial]
 			workerArgs := &WorkerArgs{
 				WorkerNum:  args.WorkerNum,
-				WorkSerial: c.Pointer,
-				FileName:   c.FileNames[c.Pointer],
+				WorkSerial: reply.WorkSerial,
+				FileName:   c.FileNames[reply.WorkSerial],
 			}
 			workerArgs.HeartBeatChan = make(chan bool)
 			c.Workers = append(c.Workers, workerArgs)
@@ -78,7 +80,39 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			//reduce work
 		}
 	case 1:
-		c.FileStatus[args.WorkSerial] = 1
+		c.FileStatus[args.WorkSerial] = 2
+		fmt.Printf("work %v done\n", args.WorkSerial)
+
+		if c.Pointer < c.TotalFileNum {
+			var mu sync.Mutex
+			mu.Lock()
+			//assign map work
+			for i := c.Pointer; i < c.TotalFileNum; i++ {
+				if c.FileStatus[i] == 0 {
+					reply.WorkSerial = i
+					break
+				}
+			}
+			//reply.WorkSerial++
+			reply.FileName = c.FileNames[reply.WorkSerial]
+
+			for _, worker := range c.Workers {
+				if args.WorkerNum == worker.WorkerNum {
+					worker.WorkSerial = reply.WorkSerial
+					worker.FileName = c.FileNames[reply.WorkSerial]
+				}
+				reply.BaseMsg = NewBaseMsg(200, "")
+			}
+
+			//workerArgs.HeartBeatChan = make(chan bool)
+			//c.Workers = append(c.Workers, workerArgs)
+			mu.Unlock()
+
+			//go workerArgs.HeartbeatCheck()
+
+		} else {
+			reply.BaseMsg = NewBaseMsg(400, "")
+		}
 	}
 
 	return nil

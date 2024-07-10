@@ -50,11 +50,11 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		go SendHeartbeat(workerNum)
 		switch reply.BaseMsg.Code {
 		case 200:
-			Map(reply.FileName, strconv.Itoa(reply.WorkSerial), mapf, reducef)
+			Map(reply.FileName, args.WorkerNum, reply.WorkSerial, mapf, reducef)
 
 		case 400:
 			log.Println("nothing to do")
-			break
+			return
 		}
 	} else {
 		fmt.Printf("call failed!\n")
@@ -82,8 +82,25 @@ func SendHeartbeat(workerNum int) {
 		}
 	}
 }
-func SendMapDoneMsg() {
+func SendMapDoneMsg(workerNum int, workSerial int,
+	mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	args := RPCArgs{
+		Status:     1,
+		WorkerNum:  workerNum,
+		WorkSerial: workSerial,
+	}
+	reply := RPCReply{}
+	ok := call("Coordinator.Worker", &args, &reply)
+	if ok {
+		switch reply.BaseMsg.Code {
+		case 200:
+			Map(reply.FileName, args.WorkerNum, reply.WorkSerial, mapf, reducef)
 
+		case 400:
+			log.Println("nothing to do")
+			return
+		}
+	}
 }
 
 // example function to show how to make an RPC call to the coordinator.
@@ -134,7 +151,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func Map(fileName string, workSerial string,
+func Map(fileName string, workerNum int, workSerial int,
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -151,10 +168,12 @@ func Map(fileName string, workSerial string,
 	kva := mapf(fileName, string(content))
 	intermediate = append(intermediate, kva...)
 
+	SendMapDoneMsg(workerNum, workSerial, mapf, reducef) //WIP
+
 	//reduce
 	sort.Sort(ByKey(intermediate)) //通过规则进行sort
 
-	oname := strings.Join([]string{"mrtmp", workSerial, strconv.Itoa(ihash(workSerial))}, "-")
+	oname := strings.Join([]string{"mrtmp", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(workSerial)))}, "-")
 	ofile, _ := os.Create(oname)
 	i := 0
 	for i < len(intermediate) {
