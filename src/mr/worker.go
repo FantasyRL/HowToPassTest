@@ -55,7 +55,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, reply.NReduceCount, mapf, reducef)
 				break
 			case 300:
-				Reduce(args.WorkerNum, reply.WorkCount, reply.NReduceCount, reducef)
+				Reduce(args.WorkerNum, reply.WorkCount, reply.NSerial, reducef) //crash
 				break
 			case 500:
 				time.Sleep(time.Second)
@@ -202,7 +202,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func Map(fileName string, workerNum int, workSerial int, nReduceCount int,
+func Map(filename string, workerNum int, workSerial int, nReduceCount int,
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -210,29 +210,32 @@ func Map(fileName string, workerNum int, workSerial int, nReduceCount int,
 	//不能这么做，分布式系统通过Map产生的中间结果一定不能相互干扰
 	//intermediate := []KeyValue{}
 	// 对txt文件进行Map，将获得的key value 切片合并
-	file, err := os.Open(fileName)
+	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", fileName)
+		log.Fatalf("cannot open %v", filename)
 	}
-	content, err := ioutil.ReadAll(file)
+	contents, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", fileName)
+		log.Fatalf("cannot read %v", filename)
 	}
 	file.Close()
-	kva := mapf(fileName, string(content)) //Map 函数生成一组中间结果（键值对）
+	kva := mapf(filename, string(contents)) //Map 函数生成一组中间结果（键值对）
+	//sort.Sort(ByKey(kva))//unnecessary
 
 	//nReduce
 	//intermediate = append(intermediate, kva...) //一个txt文件的key value
-	// 按照key，也就是单词进行排序，将相同的单词聚集在一起
-	sort.Sort(ByKey(kva))
-	//nowPointer:=0
-	fmt.Println(nReduceCount, len(kva))
+	//按照key，也就是单词进行排序，将相同的单词聚集在一起
+	intermediate := make([][]KeyValue, nReduceCount)
+	for _, kv := range kva {
+		intermediate[ihash(kv.Key)%nReduceCount] = append(intermediate[ihash(kv.Key)%nReduceCount], kv)
+	}
 	for i := 0; i < nReduceCount; i++ {
-		tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(i)))}, "-")
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(i)}, "-")
+		os.Remove(tmpName)
 		tmpFile, _ := os.Create(tmpName)
 		enc := json.NewEncoder(tmpFile)
-		for j := i * (len(kva)/nReduceCount + 1); j < (i+1)*(len(kva)/nReduceCount+1) && j < len(kva); j++ {
-			err := enc.Encode(&kva[j])
+		for _, kv := range intermediate[i] {
+			enc.Encode(kv)
 			if err != nil {
 				log.Fatal("map create tmp file error")
 			}
@@ -240,18 +243,56 @@ func Map(fileName string, workerNum int, workSerial int, nReduceCount int,
 		tmpFile.Close()
 	}
 
+	//incorrect
+	//for i := 0; i < nReduceCount; i++ {
+	//	tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(ihash(strconv.Itoa(i)))}, "-")
+	//	tmpFile, _ := os.Create(tmpName)
+	//	enc := json.NewEncoder(tmpFile)
+	//	for j := i * (len(kva)/nReduceCount + 1); j < (i+1)*(len(kva)/nReduceCount+1) && j < len(kva); j++ {
+	//		err := enc.Encode(&kva[j])
+	//		if err != nil {
+	//			log.Fatal("map create tmp file error")
+	//		}
+	//	}
+	//	tmpFile.Close()
+	//}
+
 	SendMapDoneMsg(workerNum, workSerial, mapf, reducef)
 
 }
 
 func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) string) {
+	//reduceFileNum := response.TaskId
+	//intermediate := shuffle(response.FileSlice)
+	//dir, _ := os.Getwd()
+	//tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
+	//if err != nil {
+	//	log.Fatal("Failed to create temp file", err)
+	//}
+	//i := 0
+	//for i < len(intermediate) {
+	//	j := i + 1
+	//	for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+	//		j++
+	//	}
+	//	var values []string
+	//	for k := i; k < j; k++ {
+	//		values = append(values, intermediate[k].Value)
+	//	}
+	//	output := reducef(intermediate[i].Key, values)
+	//	fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+	//	i = j
+	//}
+	//tempFile.Close()
+	//fn := fmt.Sprintf("mr-out-%d", reduceFileNum)
+	//os.Rename(tempFile.Name(), fn)
 	//reduce
 	//每个 Reduce 函数接收来自 Map 步骤的中间结果，并进行汇总、聚合或其他计算。
 	//Reduce 函数生成最终的输出结果。
 	//intermediate := []KeyValue{} //tmp
 	kva := make([]KeyValue, 0)
 	for i := 0; i < workCount; i++ {
-		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(ihash(strconv.Itoa(n)))}, "-")
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(n)}, "-")
 		tmpFile, _ := os.Open(tmpName)
 		dec := json.NewDecoder(tmpFile)
 		defer tmpFile.Close()
@@ -262,12 +303,14 @@ func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) 
 			}
 			kva = append(kva, kv)
 		}
-		os.Remove(tmpName)
+		//os.Remove(tmpName)
 	}
+	sort.Sort(ByKey(kva))
 
 	i := 0
 	//单体式通过一个比较巧妙的循环分割了reduce任务，分布式的reduce任务又应该怎么划分？
 	oname := strings.Join([]string{"mr", "out", strconv.Itoa(n)}, "-")
+	os.Remove(oname)
 	ofile, _ := os.Create(oname)
 	defer ofile.Close()
 	for i < len(kva) {
@@ -288,5 +331,9 @@ func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) 
 		i = j
 	}
 
+	for i := 0; i < workCount; i++ {
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(n)}, "-")
+		os.Remove(tmpName)
+	}
 	SendReduceDoneMsg(workerNum, n, reducef)
 }

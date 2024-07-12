@@ -116,7 +116,6 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			}
 			workerArgs.HeartBeatChan = make(chan bool)
 			c.Workers = append(c.Workers, workerArgs)
-			mu.Unlock()
 			go workerArgs.HeartbeatCheck()
 		} else if c.ReducePointer == c.NReduceCount-1 {
 			reply.BaseMsg = NewBaseMsg(400, "")
@@ -130,7 +129,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				fmt.Printf("map %v done\n", args.WorkSerial)
 			}
 		} else {
-			if c.ReduceStatus[args.NSerial] != 2 {
+			if c.ReduceStatus[args.NSerial] != 2 { //todo:crash
 				c.ReduceStatus[args.NSerial] = 2
 				fmt.Printf("reduce %v done\n", args.NSerial)
 			}
@@ -198,27 +197,32 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 	}
 	//mu.Lock()
 	//pointer指向目前连续已完成文件的最后一个文件(为了失败补救，同时确认是否进入reduce阶段)
+
+	allDone := true
 	if c.MapPointer != c.TotalFileNum-1 {
 		for i := 0; i < c.TotalFileNum; i++ {
 			if c.MapStatus[i] != 2 {
+				allDone = false
 				c.MapPointer = i
 				break
 			}
 		}
-		if c.MapStatus[c.TotalFileNum-1] == 2 && c.MapPointer == c.TotalFileNum-2 {
+		if allDone {
 			c.MapPointer = c.TotalFileNum - 1
 		}
 	} else if c.ReducePointer != c.NReduceCount-1 {
 		for i := 0; i < c.NReduceCount; i++ {
 			if c.ReduceStatus[i] != 2 {
+				allDone = false
 				c.ReducePointer = i
 				break
 			}
 		}
-		if c.ReduceStatus[c.NReduceCount-1] == 2 && c.ReducePointer == c.NReduceCount-2 {
+		if allDone {
 			c.ReducePointer = c.NReduceCount - 1
 		}
 	}
+	fmt.Println(c.ReduceStatus)
 	mu.Unlock()
 
 	return nil
@@ -256,7 +260,8 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	ret := false
 	// Your code here.
-	if c.ReducePointer == c.TotalFileNum-1 {
+	//time.Sleep(time.Second * 4)
+	if c.ReducePointer == c.NReduceCount-1 {
 		ret = true
 	}
 	return ret
@@ -312,8 +317,7 @@ func (c *Coordinator) DeRegister() {
 		select {
 		case t := <-DeregisterChan:
 			if t.WorkSerial != -1 && c.ReducePointer != c.NReduceCount-1 {
-				var mu sync.Mutex
-				mu.Lock()
+
 				switch t.Stage {
 				case 1:
 					log.Printf("%v dead,map work %v release", t.WorkerNum, t.WorkSerial)
@@ -322,7 +326,6 @@ func (c *Coordinator) DeRegister() {
 					log.Printf("%v dead,reduce work %v release", t.WorkerNum, t.NSerial)
 					c.ReduceStatus[t.NSerial] = 0
 				}
-				mu.Unlock()
 			} else {
 				log.Printf("worker %v release", t.WorkerNum)
 			}
