@@ -14,16 +14,18 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type KVServer struct {
-	mu sync.Mutex
-
+	mu  sync.Mutex
+	kva map[string]string
 	// Your definitions here.
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	reply.Value = kv.kva[args.Key]
+	defer kv.mu.Unlock()
+
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {

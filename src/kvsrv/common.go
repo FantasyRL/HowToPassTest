@@ -10,14 +10,18 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
-	Value string
+	MsgCode int //200success 500error
+	Value   string
 }
 
 type GetArgs struct {
-	Key string
+	Key      string
+	Value    string
+	WorkerId int
 	// You'll have to add definitions here.
 }
 
 type GetReply struct {
-	Value string
+	MsgCode int //200success 500error
+	Value   string
 }
