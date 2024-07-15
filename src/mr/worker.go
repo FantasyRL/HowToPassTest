@@ -55,7 +55,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				Map(reply.FileName, args.WorkerNum, reply.WorkSerial, reply.NReduceCount, mapf, reducef)
 				break
 			case 300:
-				Reduce(args.WorkerNum, reply.WorkCount, reply.NSerial, reducef) //crash
+				Reduce(args.WorkerNum, reply.WorkCount, reply.NSerial, reducef)
 				break
 			case 500:
 				time.Sleep(time.Second)
@@ -102,6 +102,7 @@ func SendMapDoneMsg(workerNum int, workSerial int,
 		Stage: 1,
 	}
 	reply := RPCReply{}
+	//todo:problem ann
 	for {
 		ok := call("Coordinator.Worker", &args, &reply)
 		if ok {
@@ -125,8 +126,12 @@ func SendMapDoneMsg(workerNum int, workSerial int,
 	}
 
 }
-func SendReduceDoneMsg(workerNum int, nSerial int,
+func SendReduceDoneMsg(workerNum int, nSerial int, workCount int,
 	reducef func(string, []string) string) {
+	for i := 0; i < workCount; i++ {
+		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(nSerial)}, "-")
+		os.Remove(tmpName)
+	}
 	args := RPCArgs{
 		Status:    1,
 		WorkerNum: workerNum,
@@ -227,12 +232,14 @@ func Map(filename string, workerNum int, workSerial int, nReduceCount int,
 	//按照key，也就是单词进行排序，将相同的单词聚集在一起
 	intermediate := make([][]KeyValue, nReduceCount)
 	for _, kv := range kva {
+		//循环一直没办法过测，而且也远不如这个好理解
 		intermediate[ihash(kv.Key)%nReduceCount] = append(intermediate[ihash(kv.Key)%nReduceCount], kv)
 	}
 	for i := 0; i < nReduceCount; i++ {
 		tmpName := strings.Join([]string{"mr", strconv.Itoa(workSerial), strconv.Itoa(i)}, "-")
-		os.Remove(tmpName)
+		os.Remove(tmpName) //aim to solve crash
 		tmpFile, _ := os.Create(tmpName)
+		defer tmpFile.Close() //个人认为面对os.Exit(1)这个神经病一样的crash，defer是很必要的
 		enc := json.NewEncoder(tmpFile)
 		for _, kv := range intermediate[i] {
 			enc.Encode(kv)
@@ -240,7 +247,7 @@ func Map(filename string, workerNum int, workSerial int, nReduceCount int,
 				log.Fatal("map create tmp file error")
 			}
 		}
-		tmpFile.Close()
+
 	}
 
 	//incorrect
@@ -262,30 +269,6 @@ func Map(filename string, workerNum int, workSerial int, nReduceCount int,
 }
 
 func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) string) {
-	//reduceFileNum := response.TaskId
-	//intermediate := shuffle(response.FileSlice)
-	//dir, _ := os.Getwd()
-	//tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
-	//if err != nil {
-	//	log.Fatal("Failed to create temp file", err)
-	//}
-	//i := 0
-	//for i < len(intermediate) {
-	//	j := i + 1
-	//	for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-	//		j++
-	//	}
-	//	var values []string
-	//	for k := i; k < j; k++ {
-	//		values = append(values, intermediate[k].Value)
-	//	}
-	//	output := reducef(intermediate[i].Key, values)
-	//	fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
-	//	i = j
-	//}
-	//tempFile.Close()
-	//fn := fmt.Sprintf("mr-out-%d", reduceFileNum)
-	//os.Rename(tempFile.Name(), fn)
 	//reduce
 	//每个 Reduce 函数接收来自 Map 步骤的中间结果，并进行汇总、聚合或其他计算。
 	//Reduce 函数生成最终的输出结果。
@@ -305,7 +288,7 @@ func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) 
 		}
 		//os.Remove(tmpName)
 	}
-	sort.Sort(ByKey(kva))
+	sort.Sort(ByKey(kva)) //necessary 没有这句就没办法过测
 
 	i := 0
 	//单体式通过一个比较巧妙的循环分割了reduce任务，分布式的reduce任务又应该怎么划分？
@@ -331,9 +314,8 @@ func Reduce(workerNum int, workCount int, n int, reducef func(string, []string) 
 		i = j
 	}
 
-	for i := 0; i < workCount; i++ {
-		tmpName := strings.Join([]string{"mr", strconv.Itoa(i), strconv.Itoa(n)}, "-")
-		os.Remove(tmpName)
-	}
-	SendReduceDoneMsg(workerNum, n, reducef)
+	//那么问题来了，如果在清理tmp文件时crash会发生什么呢
+	//有病吧
+	//所以只能在获得响应后再清理了
+	SendReduceDoneMsg(workerNum, n, workCount, reducef)
 }

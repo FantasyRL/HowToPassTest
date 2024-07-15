@@ -28,9 +28,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	mapf, reducef := loadPlugin(os.Args[1]) //加载所需的Map、Reduce func
-	//Go plugin支持将Go包编译为共享库（.so）的形式单独发布，主程序可以在运行时动态加载这些编译为动态共享库文件的go plugin，
-	//从中提取导出(exported)变量或函数的符号并在主程序的包中使用。
+	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
 	// read each input file,
@@ -38,7 +36,7 @@ func main() {
 	// accumulate the intermediate Map output.
 	//
 	intermediate := []mr.KeyValue{}
-	for _, filename := range os.Args[2:] { // 读取第三个条目及之后的语句//此处要实现并发？
+	for _, filename := range os.Args[2:] {
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -58,7 +56,7 @@ func main() {
 	// rather than being partitioned into NxM buckets.
 	//
 
-	sort.Sort(ByKey(intermediate)) //通过规则进行sort
+	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-0"
 	ofile, _ := os.Create(oname)
@@ -95,11 +93,11 @@ func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(strin
 	if err != nil {
 		log.Fatalf("cannot load plugin %v", filename)
 	}
-	xmapf, err := p.Lookup("Map") //查找名为map的函数
+	xmapf, err := p.Lookup("Map")
 	if err != nil {
 		log.Fatalf("cannot find Map in %v", filename)
 	}
-	mapf := xmapf.(func(string, string) []mr.KeyValue) //为mapf添加函数头
+	mapf := xmapf.(func(string, string) []mr.KeyValue)
 	xreducef, err := p.Lookup("Reduce")
 	if err != nil {
 		log.Fatalf("cannot find Reduce in %v", filename)

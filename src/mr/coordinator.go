@@ -55,7 +55,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 	mu.Lock()
 	switch args.Status {
 	case 0: //初次
-		if c.MapPointer != c.TotalFileNum-1 {
+		if c.MapPointer != c.TotalFileNum {
 			isExistTodoFlag := false
 			for i := c.MapPointer; i < c.TotalFileNum; i++ {
 				if c.MapStatus[i] == 0 {
@@ -87,7 +87,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			//mu.Unlock()
 			go workerArgs.HeartbeatCheck()
 
-		} else if c.ReducePointer != c.NReduceCount-1 {
+		} else if c.ReducePointer != c.NReduceCount {
 			//reduce work
 			isExistTodoFlag := false
 			for i := c.ReducePointer; i < c.NReduceCount; i++ {
@@ -117,7 +117,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			workerArgs.HeartBeatChan = make(chan bool)
 			c.Workers = append(c.Workers, workerArgs)
 			go workerArgs.HeartbeatCheck()
-		} else if c.ReducePointer == c.NReduceCount-1 {
+		} else if c.ReducePointer == c.NReduceCount {
 			reply.BaseMsg = NewBaseMsg(400, "")
 		} else {
 			reply.BaseMsg = NewBaseMsg(500, "") //wait
@@ -129,13 +129,13 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				fmt.Printf("map %v done\n", args.WorkSerial)
 			}
 		} else {
-			if c.ReduceStatus[args.NSerial] != 2 { //todo:crash
+			if c.ReduceStatus[args.NSerial] != 2 {
 				c.ReduceStatus[args.NSerial] = 2
 				fmt.Printf("reduce %v done\n", args.NSerial)
 			}
 		}
 
-		if c.MapPointer != c.TotalFileNum-1 {
+		if c.MapPointer != c.TotalFileNum {
 			//assign map work
 			isExistTodoFlag := false
 			for i := c.MapPointer; i < c.TotalFileNum; i++ {
@@ -163,7 +163,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				}
 				reply.BaseMsg = NewBaseMsg(200, "")
 			}
-		} else if c.ReducePointer != c.NReduceCount-1 {
+		} else if c.ReducePointer != c.NReduceCount {
 			isExistTodoFlag := false
 			for i := c.ReducePointer; i < c.NReduceCount; i++ {
 				if c.ReduceStatus[i] == 0 {
@@ -189,7 +189,7 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 				}
 				reply.BaseMsg = NewBaseMsg(300, "")
 			}
-		} else if c.ReducePointer == c.NReduceCount-1 {
+		} else if c.ReducePointer == c.NReduceCount {
 			reply.BaseMsg = NewBaseMsg(400, "")
 		} else {
 			reply.BaseMsg = NewBaseMsg(500, "") //wait
@@ -197,9 +197,9 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 	}
 	//mu.Lock()
 	//pointer指向目前连续已完成文件的最后一个文件(为了失败补救，同时确认是否进入reduce阶段)
-
-	allDone := true
-	if c.MapPointer != c.TotalFileNum-1 {
+	//todo:problem ann
+	if c.MapPointer != c.TotalFileNum {
+		allDone := true
 		for i := 0; i < c.TotalFileNum; i++ {
 			if c.MapStatus[i] != 2 {
 				allDone = false
@@ -208,9 +208,10 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			}
 		}
 		if allDone {
-			c.MapPointer = c.TotalFileNum - 1
+			c.MapPointer = c.TotalFileNum
 		}
-	} else if c.ReducePointer != c.NReduceCount-1 {
+	} else if c.ReducePointer != c.NReduceCount {
+		allDone := true
 		for i := 0; i < c.NReduceCount; i++ {
 			if c.ReduceStatus[i] != 2 {
 				allDone = false
@@ -219,10 +220,11 @@ func (c *Coordinator) Worker(args *RPCArgs, reply *RPCReply) error {
 			}
 		}
 		if allDone {
-			c.ReducePointer = c.NReduceCount - 1
+			c.ReducePointer = c.NReduceCount
 		}
 	}
-	fmt.Println(c.ReduceStatus)
+	//fmt.Println(c.ReduceStatus)
+	//fmt.Println(c.ReducePointer)
 	mu.Unlock()
 
 	return nil
@@ -261,7 +263,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 	// Your code here.
 	//time.Sleep(time.Second * 4)
-	if c.ReducePointer == c.NReduceCount-1 {
+	if c.ReducePointer == c.NReduceCount {
 		ret = true
 	}
 	return ret
@@ -316,8 +318,7 @@ func (c *Coordinator) DeRegister() {
 	for {
 		select {
 		case t := <-DeregisterChan:
-			if t.WorkSerial != -1 && c.ReducePointer != c.NReduceCount-1 {
-
+			if c.ReducePointer != c.NReduceCount {
 				switch t.Stage {
 				case 1:
 					log.Printf("%v dead,map work %v release", t.WorkerNum, t.WorkSerial)
