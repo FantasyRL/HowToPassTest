@@ -3,12 +3,14 @@ package kvsrv
 import (
 	"6.5840/labrpc"
 	"log"
+	"sync"
 )
 import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
 	server *labrpc.ClientEnd
+	mu     sync.Mutex
 	//todo: You will have to modify this struct.
 }
 
@@ -24,6 +26,7 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck.server = server
 
 	// You'll have to add code here.
+
 	return ck
 }
 
@@ -43,13 +46,21 @@ func (ck *Clerk) Get(key string) string {
 		Key: key,
 	}
 	reply := &GetReply{}
-	ok := ck.server.Call("KVServer.Get", args, reply)
+	ck.mu.Lock()
+	ok := false
+	//for {
+	ok = ck.server.Call("KVServer.Get", args, reply)
 	if ok {
+		ck.mu.Unlock()
 		return reply.Value
 	} else {
 		log.Printf("rpc call failed!")
+		//continue
+		ck.mu.Unlock()
+		return ""
 	}
-	return ""
+	//}
+
 }
 
 // shared by Put and Append.
@@ -63,23 +74,33 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
 	args := &PutAppendArgs{
-		Key: key,
+		Key:   key,
+		Value: value,
 	}
 	reply := &PutAppendReply{}
-	ok := ck.server.Call("KVServer."+op, args, reply)
+	ck.mu.Lock()
+	ok := false
+	//for {
+	ok = ck.server.Call("KVServer."+op, args, reply)
 	if ok {
+		ck.mu.Unlock()
 		if reply.MsgCode != 200 {
 			log.Printf("%s client error", op)
 			return ""
 		}
 		return reply.Value //just for append
 	} else {
-		log.Printf("rpc call failed!")
+		log.Printf(op + "rpc call failed!")
+		ck.mu.Unlock()
 		return ""
+		//continue
 	}
+	//}
+
 }
 
 func (ck *Clerk) Put(key string, value string) {
+	//DPrintf("Put %s %s", key, value)
 	ck.PutAppend(key, value, "Put")
 }
 
