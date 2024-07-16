@@ -2,7 +2,7 @@ package kvsrv
 
 import (
 	"6.5840/labrpc"
-	"log"
+	rand2 "math/rand"
 	"sync"
 )
 import "crypto/rand"
@@ -43,23 +43,23 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	//You will have to modify this function.
 	args := &GetArgs{
-		Key: key,
+		Key:      key,
+		WorkerId: rand2.Int(),
 	}
 	reply := &GetReply{}
 	ck.mu.Lock()
 	ok := false
-	//for {
-	ok = ck.server.Call("KVServer.Get", args, reply)
-	if ok {
-		ck.mu.Unlock()
-		return reply.Value
-	} else {
-		log.Printf("rpc call failed!")
-		//continue
-		ck.mu.Unlock()
-		return ""
+	for {
+		ok = ck.server.Call("KVServer.Get", args, reply)
+		if ok {
+			ck.mu.Unlock()
+			return reply.Value
+		} else {
+			//DPrintf("get rpc recovering")
+			args.IsRecover = true
+			continue
+		}
 	}
-	//}
 
 }
 
@@ -74,28 +74,24 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
 	args := &PutAppendArgs{
-		Key:   key,
-		Value: value,
+		Key:      key,
+		Value:    value,
+		WorkerId: rand2.Int(),
 	}
 	reply := &PutAppendReply{}
 	ck.mu.Lock()
 	ok := false
-	//for {
-	ok = ck.server.Call("KVServer."+op, args, reply)
-	if ok {
-		ck.mu.Unlock()
-		if reply.MsgCode != 200 {
-			log.Printf("%s client error", op)
-			return ""
+	for {
+		ok = ck.server.Call("KVServer."+op, args, reply)
+		if ok {
+			ck.mu.Unlock()
+			return reply.Value //just for append
+		} else {
+			//DPrintf(op + "rpc call recovering")
+			args.IsRecover = true
+			continue
 		}
-		return reply.Value //just for append
-	} else {
-		log.Printf(op + "rpc call failed!")
-		ck.mu.Unlock()
-		return ""
-		//continue
 	}
-	//}
 
 }
 

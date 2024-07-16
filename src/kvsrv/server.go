@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -38,16 +38,30 @@ type KVServer struct {
 	isWorking          chan bool
 	RecentPutForAppend bool
 	queue              []int
+	recoverReply       map[int]string
 	// Your definitions here.
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	DPrintf("%s", "get call")
+	//DPrintf("%s", "get call")
 	// Your code here.
 	kv.mu.Lock()
-	kv.Push(1)
+	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
+		//if value != "nil" {
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+		//}
+		//delete(kv.recoverReply, args.WorkerId)
+	}
+
+	//if !args.IsRecover {
+	kv.Push(args.WorkerId)
+	//}
 	for {
-		if kv.GetPop() == 2 {
+		//DPrintf("bao")
+		if kv.GetPop() != args.WorkerId {
 			time.Sleep(time.Millisecond * 10)
 		} else {
 			break
@@ -61,6 +75,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	//DPrintf("Get:%v\n", kv.kva)
 
+	kv.recoverReply[args.WorkerId] = reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -68,15 +83,35 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	DPrintf("%s", "put call")
+	//DPrintf("%s", "put call")
 	// Your code here.
 	//if <-kv.isWorking {
 	kv.mu.Lock()
-	kv.Push(2)
+	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
+		//if value != nil {
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+		//}
+		//delete(kv.recoverReply, args.WorkerId)
+	}
+	//if !args.IsRecover {
+	kv.Push(args.WorkerId)
+	//}
+	for {
+		//DPrintf("bao")
+		if kv.GetPop() != args.WorkerId {
+			time.Sleep(time.Millisecond * 10)
+		} else {
+			break
+		}
+	}
 
 	kv.kva[args.Key] = args.Value
 	//DPrintf("Get:%v\n", kv.kva)
 
+	kv.recoverReply[args.WorkerId] = args.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -85,13 +120,26 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	DPrintf("%s", "append call")
+	//DPrintf("%s", "append call")
 	//if <-kv.isWorking {
 	// Your code here.
 	kv.mu.Lock()
-	kv.Push(3)
+	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
+		//if value != nil {
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+		//}
+		//delete(kv.recoverReply, args.WorkerId)
+		//kv.recoverReply[args.WorkerId] = nil
+	}
+	//if !args.IsRecover {
+	kv.Push(args.WorkerId)
+	//}
 	for {
-		if kv.GetPop() == 2 {
+		//DPrintf("bao")
+		if kv.GetPop() != args.WorkerId {
 			time.Sleep(time.Millisecond * 10)
 		} else {
 			break
@@ -105,6 +153,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.kva[args.Key] = strings.Join([]string{kv.kva[args.Key], args.Value}, "")
 
+	kv.recoverReply[args.WorkerId] = reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -116,6 +165,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func StartKVServer() *KVServer {
 	kv := new(KVServer)
 	kv.kva = make(map[string]string)
+	kv.recoverReply = make(map[int]string)
 	kv.isWorking = make(chan bool, 1)
 	kv.queue = make([]int, 0)
 	kv.isWorking <- true
