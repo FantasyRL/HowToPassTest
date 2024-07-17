@@ -6,6 +6,7 @@ type PutAppendArgs struct {
 	Value     string
 	WorkerId  int
 	IsRecover bool
+	IsNoDie   bool
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
@@ -21,6 +22,7 @@ type GetArgs struct {
 	Value     string
 	WorkerId  int
 	IsRecover bool
+	IsNoDie   bool
 	// You'll have to add definitions here.
 }
 

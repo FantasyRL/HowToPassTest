@@ -49,9 +49,12 @@ func (ck *Clerk) Get(key string) string {
 	reply := &GetReply{}
 	ck.mu.Lock()
 	ok := false
+
 	for {
 		ok = ck.server.Call("KVServer.Get", args, reply)
 		if ok {
+			args.IsNoDie = true
+			ok = ck.server.Call("KVServer.Get", args, reply)
 			ck.mu.Unlock()
 			return reply.Value
 		} else {
@@ -84,6 +87,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	for {
 		ok = ck.server.Call("KVServer."+op, args, reply)
 		if ok {
+			args.IsNoDie = true
+			ok = ck.server.Call("KVServer."+op, args, reply)
 			ck.mu.Unlock()
 			return reply.Value //just for append
 		} else {
