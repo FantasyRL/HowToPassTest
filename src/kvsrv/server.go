@@ -28,17 +28,17 @@ func (kv *KVServer) Push(i int) {
 func (kv *KVServer) Pop() {
 	kv.queue = kv.queue[1:]
 }
-func (kv *KVServer) GetPop() int {
+func (kv *KVServer) GetTop() int {
 	return kv.queue[0]
 }
 
 type KVServer struct {
-	mu                 sync.Mutex
-	kva                map[string]string
-	isWorking          chan bool
+	mu  sync.Mutex
+	kva map[string]string
+	//isWorking          chan bool
 	RecentPutForAppend bool
 	queue              []int
-	recoverReply       map[int]*string
+	recoverReply       map[int]string //todo:optimize
 	// Your definitions here.
 }
 
@@ -46,10 +46,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//DPrintf("%s", "get call")
 	// Your code here.
 	kv.mu.Lock()
+	if args.IsNoDie {
+		delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+	}
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != "nil" {
-		reply.Value = *value
-		delete(kv.recoverReply, args.WorkerId)
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -61,7 +66,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//}
 	for {
 		//DPrintf("bao")
-		if kv.GetPop() != args.WorkerId {
+		if kv.GetTop() != args.WorkerId {
 			time.Sleep(time.Millisecond * 10)
 		} else {
 			break
@@ -75,7 +80,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	//DPrintf("Get:%v\n", kv.kva)
 
-	kv.recoverReply[args.WorkerId] = &reply.Value
+	kv.recoverReply[args.WorkerId] = reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -87,10 +92,15 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	//if <-kv.isWorking {
 	kv.mu.Lock()
+	if args.IsNoDie {
+		delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+	}
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != nil {
-		reply.Value = *value
-		delete(kv.recoverReply, args.WorkerId)
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -101,7 +111,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	//}
 	for {
 		//DPrintf("bao")
-		if kv.GetPop() != args.WorkerId {
+		if kv.GetTop() != args.WorkerId {
 			time.Sleep(time.Millisecond * 10)
 		} else {
 			break
@@ -111,7 +121,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.kva[args.Key] = args.Value
 	//DPrintf("Get:%v\n", kv.kva)
 
-	kv.recoverReply[args.WorkerId] = &args.Value
+	kv.recoverReply[args.WorkerId] = args.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -124,10 +134,15 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	//if <-kv.isWorking {
 	// Your code here.
 	kv.mu.Lock()
+	if args.IsNoDie {
+		delete(kv.recoverReply, args.WorkerId)
+		kv.mu.Unlock()
+		return
+	}
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != nil {
-		reply.Value = *value
-		delete(kv.recoverReply, args.WorkerId)
+		reply.Value = value
+		//delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -139,7 +154,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	//}
 	for {
 		//DPrintf("bao")
-		if kv.GetPop() != args.WorkerId {
+		if kv.GetTop() != args.WorkerId {
 			time.Sleep(time.Millisecond * 10)
 		} else {
 			break
@@ -153,7 +168,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.kva[args.Key] = strings.Join([]string{kv.kva[args.Key], args.Value}, "")
 
-	kv.recoverReply[args.WorkerId] = &reply.Value
+	kv.recoverReply[args.WorkerId] = reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -165,12 +180,11 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func StartKVServer() *KVServer {
 	kv := new(KVServer)
 	kv.kva = make(map[string]string)
-	kv.recoverReply = make(map[int]*string)
-	kv.isWorking = make(chan bool, 1)
+	kv.recoverReply = make(map[int]string)
+	//kv.isWorking = make(chan bool, 1)
 	kv.queue = make([]int, 0)
-	kv.isWorking <- true
+	//kv.isWorking <- true
 	kv.RecentPutForAppend = false
-
 	// You may need initialization code here.
 
 	return kv
