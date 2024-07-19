@@ -38,7 +38,7 @@ type KVServer struct {
 	isWorking          chan bool
 	RecentPutForAppend bool
 	queue              []int
-	recoverReply       map[int]string
+	recoverReply       map[int]*string
 	// Your definitions here.
 }
 
@@ -48,8 +48,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != "nil" {
-		reply.Value = value
-		//delete(kv.recoverReply, args.WorkerId)
+		reply.Value = *value
+		delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -75,7 +75,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	//DPrintf("Get:%v\n", kv.kva)
 
-	kv.recoverReply[args.WorkerId] = reply.Value
+	kv.recoverReply[args.WorkerId] = &reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -89,8 +89,8 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != nil {
-		reply.Value = value
-		//delete(kv.recoverReply, args.WorkerId)
+		reply.Value = *value
+		delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -111,7 +111,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.kva[args.Key] = args.Value
 	//DPrintf("Get:%v\n", kv.kva)
 
-	kv.recoverReply[args.WorkerId] = args.Value
+	kv.recoverReply[args.WorkerId] = &args.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -126,8 +126,8 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	if value, ok := kv.recoverReply[args.WorkerId]; ok && args.IsRecover {
 		//if value != nil {
-		reply.Value = value
-		//delete(kv.recoverReply, args.WorkerId)
+		reply.Value = *value
+		delete(kv.recoverReply, args.WorkerId)
 		kv.mu.Unlock()
 		return
 		//}
@@ -153,7 +153,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.kva[args.Key] = strings.Join([]string{kv.kva[args.Key], args.Value}, "")
 
-	kv.recoverReply[args.WorkerId] = reply.Value
+	kv.recoverReply[args.WorkerId] = &reply.Value
 	kv.Pop()
 	kv.mu.Unlock()
 	reply.MsgCode = 200
@@ -165,11 +165,12 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func StartKVServer() *KVServer {
 	kv := new(KVServer)
 	kv.kva = make(map[string]string)
-	kv.recoverReply = make(map[int]string)
+	kv.recoverReply = make(map[int]*string)
 	kv.isWorking = make(chan bool, 1)
 	kv.queue = make([]int, 0)
 	kv.isWorking <- true
 	kv.RecentPutForAppend = false
+
 	// You may need initialization code here.
 
 	return kv
