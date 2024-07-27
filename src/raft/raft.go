@@ -55,26 +55,27 @@ type Raft struct {
 	mu        deadlock.Mutex      // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	me        int64               // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	//default
-	currentTerm int
-	votedFor    int
+	currentTerm int64
+	votedFor    int64
 	log         []Entry
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+	commitIndex int64
+	lastApplied int64
+	nextIndex   []int64
+	matchIndex  []int64
 	//my
-	status        ServerStatus
+	status        int32
 	LastHeartBeat time.Time
 	ElectionSync  sync.WaitGroup
 }
-type ServerStatus int
+
+//type ServerStatus int32
 
 const (
 	Follower = iota
@@ -83,7 +84,7 @@ const (
 )
 
 type Entry struct {
-	Term    int
+	Term    int64
 	Command interface{} //machine command
 }
 
@@ -95,10 +96,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (3A).
 	rf.mu.Lock()
-	term = rf.currentTerm
+	term = int(atomic.LoadInt64(&rf.currentTerm))
 	DPrintf("Id:%v Term:%v Status:%v", rf.me, term, rf.status)
 	//DPrintf("%v", len(rf.peers))
-	if rf.status == Leader {
+	if atomic.LoadInt32(&rf.status) == Leader {
 		isleader = true
 	}
 	rf.mu.Unlock()
@@ -154,17 +155,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term         int //候选者任期
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
+	Term         int64 //候选者任期
+	CandidateId  int64
+	LastLogIndex int64
+	LastLogTerm  int64
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        int
+	Term        int64
 	VoteGranted bool
 	IsExpired   bool
 }
@@ -176,33 +177,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.killed() {
 		reply.VoteGranted = false
 		reply.IsExpired = false
-		rf.status = Follower
-		rf.votedFor = -1
+		atomic.StoreInt32(&rf.status, Follower)
+		atomic.StoreInt64(&rf.votedFor, -1)
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term < rf.currentTerm {
+	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
 		reply.VoteGranted = false
 		reply.IsExpired = true
-		reply.Term = rf.currentTerm
+		reply.Term = atomic.LoadInt64(&rf.currentTerm)
+		atomic.StoreInt64(&rf.votedFor, args.CandidateId)
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term > rf.currentTerm {
-		//rf.myTicker.Reset(time.Duration(100+(rand.Int63()%300)) * time.Millisecond) //阻止自己当candidate
-		rf.status = Follower
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
+	if args.Term > atomic.LoadInt64(&rf.currentTerm) {
+		atomic.StoreInt32(&rf.status, Follower)
+		atomic.StoreInt64(&rf.votedFor, -1)
+		atomic.StoreInt64(&rf.currentTerm, args.Term)
 	}
-	if rf.votedFor == -1 {
+	if atomic.LoadInt64(&rf.votedFor) == -1 {
 		//currentLogIndex := 0
 		//if len(rf.log)-1 >= 0 {
 		//	currentLogIndex = rf.log[currentLogIndex].Term
 		//}
 		//if len(rf.log)-1 <= args.LastLogIndex && args.LastLogIndex >= currentLogIndex {
 		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		//rf.myTicker.Reset(time.Duration(100+(rand.Int63()%300)) * time.Millisecond) //阻止自己当candidate
+		atomic.StoreInt64(&rf.votedFor, args.CandidateId)
 		rf.LastHeartBeat = time.Now()
 		//} else {
 		//reply.VoteGranted = false
@@ -217,17 +217,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
-	Term         int
-	LeaderId     int
-	prevLogIndex int
-	prevLogTerm  int
+	Term         int64
+	LeaderId     int64
+	PrevLogIndex int64
+	PrevLogTerm  int64
 	//entries[]
-	LeaderCommitIndex int
+	LeaderCommitIndex int64
 }
 
 type AppendEntriesReply struct {
 	// Your data here (3A).
-	Term    int
+	Term    int64
 	Success bool
 
 	IsExpired bool
@@ -239,19 +239,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	if rf.killed() {
 		reply.Success = false
-		rf.votedFor = -1
-		rf.status = Follower
+		atomic.StoreInt64(&rf.votedFor, -1)
+		atomic.StoreInt32(&rf.status, Follower)
 		return
 	}
-	if args.Term < rf.currentTerm {
+	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
 		reply.IsExpired = true
-		reply.Term = rf.currentTerm
+		reply.Term = atomic.LoadInt64(&rf.currentTerm)
 		reply.Success = false
 		return
 	}
-	rf.votedFor = args.LeaderId
+	atomic.StoreInt64(&rf.votedFor, args.LeaderId)
 	rf.LastHeartBeat = time.Now()
-	rf.currentTerm = args.Term
+	atomic.StoreInt64(&rf.currentTerm, args.Term)
+
 	reply.Success = true
 }
 
@@ -324,7 +325,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-
+	atomic.StoreInt32(&rf.status, Follower)
 }
 
 func (rf *Raft) killed() bool {
@@ -340,10 +341,10 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		timeoutTime := time.Now().Unix()
-		ms := 150 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
-		if rf.LastHeartBeat.Unix() < timeoutTime && rf.status != Leader {
+		if rf.LastHeartBeat.Unix() < timeoutTime && atomic.LoadInt32(&rf.status) != Leader {
 			go rf.Election() //election will start after mu.Unlock()
 		}
 		rf.mu.Unlock()
@@ -355,11 +356,12 @@ func (rf *Raft) Election() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.LastHeartBeat = time.Now()
-	voteCount := 1
+	var voteCount int64 = 1
+	expired := false
 	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         atomic.LoadInt64(&rf.currentTerm),
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
+		LastLogIndex: int64(len(rf.log) - 1),
 	}
 	if args.LastLogIndex != -1 {
 		args.LastLogTerm = rf.log[args.LastLogIndex].Term
@@ -368,11 +370,12 @@ func (rf *Raft) Election() {
 	}
 	rf.mu.Unlock()
 	//currentPeerNum := len(rf.peers)
+	//fmt.Println(atomic.LoadInt64(&rf.me), atomic.LoadInt64(&rf.currentTerm))
 	for i, _ := range rf.peers {
-		if rf.status != Candidate {
+		if expired {
 			break
 		}
-		if i == rf.me {
+		if i == int(rf.me) {
 			continue
 		}
 		reply := &RequestVoteReply{}
@@ -383,72 +386,69 @@ func (rf *Raft) Election() {
 				rf.mu.Lock()
 				//DPrintf("%v:%v", rf.me, *reply)
 				if reply.IsExpired {
-					rf.status = Follower
-					rf.votedFor = -1
-					rf.currentTerm = reply.Term
+					atomic.StoreInt32(&rf.status, Follower)
+					atomic.StoreInt64(&rf.votedFor, -1)
+					atomic.StoreInt64(&rf.currentTerm, reply.Term)
+					expired = true
 					rf.mu.Unlock()
 					return
 				}
-				if reply.VoteGranted {
-					voteCount++
-					if voteCount > len(rf.peers)/2 && rf.status == Candidate {
-						rf.status = Leader
+				if reply.VoteGranted && !expired {
+					atomic.AddInt64(&voteCount, 1)
+
+					if atomic.LoadInt64(&voteCount) > int64(len(rf.peers)/2) && atomic.LoadInt32(&rf.status) == Candidate {
+						atomic.StoreInt32(&rf.status, Leader)
 					}
 				}
 				rf.mu.Unlock()
 			}
-			//else {
-			//	currentPeerNum--
-			//	if voteCount > currentPeerNum/2 && rf.status == Candidate {
-			//		rf.status = Leader
-			//	}
-			//}
 
 		}(i)
 	}
 	rf.ElectionSync.Wait()
-	if rf.status == Leader {
+	if expired {
+		atomic.StoreInt32(&rf.status, Follower)
+	}
+	if atomic.LoadInt32(&rf.status) == Leader {
 		rf.DiscoverServers()
 	}
 }
 
 func (rf *Raft) DiscoverServers() {
-	for rf.status == Leader && !rf.killed() {
+	for atomic.LoadInt32(&rf.status) == Leader && !rf.killed() {
 		rf.mu.Lock()
 		rf.LastHeartBeat = time.Now()
 		//DPrintf("%v %v", rf.currentTerm, rf.me)
 		args := &AppendEntriesArgs{
-			Term:              rf.currentTerm,
+			Term:              atomic.LoadInt64(&rf.currentTerm),
 			LeaderId:          rf.me,
 			LeaderCommitIndex: rf.commitIndex,
 		}
 		rf.mu.Unlock()
 		for i, _ := range rf.peers {
-			if rf.status != Candidate {
+			if atomic.LoadInt32(&rf.status) != Leader {
 				break
 			}
-			if i == rf.me {
+			if i == int(rf.me) {
 				continue
 			}
 			reply := &AppendEntriesReply{}
 			//rf.ElectionSync.Add(1)
 			go func(serverId int) {
 				//defer rf.ElectionSync.Done()
-				rf.mu.Lock()
 				if rf.sendAppendEntries(serverId, args, reply) {
 					if reply.IsExpired {
-						rf.currentTerm = reply.Term
-						rf.status = Follower
-						rf.votedFor = -1
-						rf.mu.Unlock()
+						atomic.StoreInt64(&rf.currentTerm, reply.Term)
+						atomic.StoreInt32(&rf.status, Follower)
+						atomic.StoreInt64(&rf.votedFor, -1)
 						return
 					}
 				}
 
 			}(i)
 		}
-		ms := 100 + (rand.Int63() % 50)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		//ms := 100 + (rand.Int63() % 50)
+		//time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -466,15 +466,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = me
+	rf.me = int64(me)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.status = Follower
 	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.nextIndex = make([]int, 0)
-	rf.nextIndex = make([]int, 0)
-	rf.matchIndex = make([]int, 0)
+	rf.nextIndex = make([]int64, 0)
+	rf.nextIndex = make([]int64, 0)
+	rf.matchIndex = make([]int64, 0)
 	rf.log = make([]Entry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
