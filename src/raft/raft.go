@@ -66,6 +66,7 @@ type Raft struct {
 	votedFor      int64
 	status        int32
 	LastHeartBeat time.Time
+	LastLogCome   chan bool
 	ElectionSync  sync.WaitGroup
 	//3B
 	log         []Entry
@@ -310,9 +311,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
 	// Your code here (3B).
-
+	if rf.killed() {
+		return index, term, false
+	}
+	term = int(atomic.LoadInt64(&rf.currentTerm))
+	if atomic.LoadInt32(&rf.status) != Leader {
+		isLeader = false
+	} else {
+		rf.mu.Lock()
+		newEntry := Entry{
+			Command: command,
+			Term:    rf.currentTerm,
+			Index:   rf.commitIndex,
+		}
+		rf.log = append(rf.log, newEntry)
+		rf.LastLogCome <- true
+		rf.mu.Unlock()
+	}
 	return index, term, isLeader
 }
 
@@ -424,6 +440,8 @@ func (rf *Raft) Election() {
 }
 
 func (rf *Raft) DiscoverServers() {
+	var isNewEntry int32 = -1
+
 	for atomic.LoadInt32(&rf.status) == Leader && !rf.killed() {
 		rf.mu.Lock()
 		rf.LastHeartBeat = time.Now()
@@ -488,6 +506,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.LastHeartBeat = time.Now()
+	rf.LastLogCome = make(chan bool)
 	rf.ElectionSync = sync.WaitGroup{}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
