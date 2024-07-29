@@ -97,7 +97,6 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
 	rf.mu.Lock()
 	term = int(atomic.LoadInt64(&rf.currentTerm))
-	DPrintf("Id:%v Term:%v Status:%v", rf.me, term, rf.status)
 	//DPrintf("%v", len(rf.peers))
 	if atomic.LoadInt32(&rf.status) == Leader {
 		isleader = true
@@ -168,15 +167,18 @@ type RequestVoteReply struct {
 	Term        int64
 	VoteGranted bool
 	IsExpired   bool
+	IsKilled    bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	reply.IsKilled = false
 	rf.mu.Lock()
 	if rf.killed() {
 		reply.VoteGranted = false
 		reply.IsExpired = false
+		reply.IsKilled = true
 		atomic.StoreInt32(&rf.status, Follower)
 		atomic.StoreInt64(&rf.votedFor, -1)
 		rf.mu.Unlock()
@@ -352,9 +354,9 @@ func (rf *Raft) ticker() {
 }
 func (rf *Raft) Election() {
 	rf.mu.Lock()
-	rf.status = Candidate
-	rf.currentTerm++
-	rf.votedFor = rf.me
+	atomic.StoreInt32(&rf.status, Candidate)
+	atomic.AddInt64(&rf.currentTerm, 1)
+	atomic.StoreInt64(&rf.votedFor, rf.me)
 	rf.LastHeartBeat = time.Now()
 	var voteCount int64 = 1
 	expired := false
@@ -369,7 +371,7 @@ func (rf *Raft) Election() {
 		args.LastLogTerm = 0
 	}
 	rf.mu.Unlock()
-	//currentPeerNum := len(rf.peers)
+	currentPeerNum := int64(len(rf.peers))
 	//fmt.Println(atomic.LoadInt64(&rf.me), atomic.LoadInt64(&rf.currentTerm))
 	for i, _ := range rf.peers {
 		if expired {
@@ -393,18 +395,24 @@ func (rf *Raft) Election() {
 					rf.mu.Unlock()
 					return
 				}
+				if reply.IsKilled {
+					atomic.AddInt64(&currentPeerNum, -1)
+				}
 				if reply.VoteGranted && !expired {
 					atomic.AddInt64(&voteCount, 1)
 
-					if atomic.LoadInt64(&voteCount) > int64(len(rf.peers)/2) && atomic.LoadInt32(&rf.status) == Candidate {
+					if atomic.LoadInt64(&voteCount) > atomic.LoadInt64(&currentPeerNum)/2 && atomic.LoadInt32(&rf.status) == Candidate {
 						atomic.StoreInt32(&rf.status, Leader)
 					}
 				}
 				rf.mu.Unlock()
+			} else {
+				atomic.AddInt64(&currentPeerNum, -1)
 			}
 
 		}(i)
 	}
+	time.Sleep(20 * time.Millisecond)
 	rf.ElectionSync.Wait()
 	if expired {
 		atomic.StoreInt32(&rf.status, Follower)
@@ -447,8 +455,8 @@ func (rf *Raft) DiscoverServers() {
 
 			}(i)
 		}
-		//ms := 100 + (rand.Int63() % 50)
-		//time.Sleep(time.Duration(ms) * time.Millisecond)
+		ms := 101
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
