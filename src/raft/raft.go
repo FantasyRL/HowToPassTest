@@ -61,18 +61,18 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	//default
-	currentTerm int64
-	votedFor    int64
+	//3A
+	currentTerm   int64
+	votedFor      int64
+	status        int32
+	LastHeartBeat time.Time
+	ElectionSync  sync.WaitGroup
+	//3B
 	log         []Entry
 	commitIndex int64
 	lastApplied int64
 	nextIndex   []int64
 	matchIndex  []int64
-	//my
-	status        int32
-	LastHeartBeat time.Time
-	ElectionSync  sync.WaitGroup
 }
 
 //type ServerStatus int32
@@ -86,6 +86,7 @@ const (
 type Entry struct {
 	Term    int64
 	Command interface{} //machine command
+	Index   int64
 }
 
 // return currentTerm and whether this server
