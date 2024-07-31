@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	//	"bytes"
 	"math/rand"
@@ -66,14 +67,15 @@ type Raft struct {
 	votedFor      int64
 	status        int32
 	LastHeartBeat time.Time
-	LastLogCome   chan bool
-	ElectionSync  sync.WaitGroup
+	//LastLogCome   chan bool
+	ElectionSync sync.WaitGroup //原来这玩意没用？？？？
 	//3B
-	log         []Entry
-	commitIndex int64
-	lastApplied int64
-	nextIndex   []int64
-	matchIndex  []int64
+	log               LogEntries
+	commitIndex       int64
+	lastApplied       int64
+	nextIndex         []int64
+	matchIndex        []int64
+	AppendEntriesSync sync.WaitGroup
 }
 
 //type ServerStatus int32
@@ -87,7 +89,36 @@ const (
 type Entry struct {
 	Term    int64
 	Command interface{} //machine command
-	Index   int64
+	//Index   int64
+}
+type LogEntries []Entry
+
+// get entry
+func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
+	if index <= 0 {
+		return &Entry{
+			Command: nil,
+			Term:    0,
+		}
+	}
+	if index > int64(len(logEntries)) {
+		return &Entry{
+			Command: nil,
+			Term:    -1,
+		}
+	}
+	return &logEntries[index-1]
+}
+
+// get slice
+func (logEntries LogEntries) getEntrySlice(startIndex, endIndex int64) LogEntries {
+	if startIndex <= 0 {
+		startIndex = 1
+	}
+	if startIndex > endIndex {
+		endIndex = startIndex
+	}
+	return logEntries[startIndex-1 : endIndex-1]
 }
 
 // return currentTerm and whether this server
@@ -177,13 +208,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	reply.IsKilled = false
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.killed() {
 		reply.VoteGranted = false
 		reply.IsExpired = false
 		reply.IsKilled = true
 		atomic.StoreInt32(&rf.status, Follower)
 		atomic.StoreInt64(&rf.votedFor, -1)
-		rf.mu.Unlock()
 		return
 	}
 	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
@@ -191,7 +222,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.IsExpired = true
 		reply.Term = atomic.LoadInt64(&rf.currentTerm)
 		atomic.StoreInt64(&rf.votedFor, args.CandidateId)
-		rf.mu.Unlock()
 		return
 	}
 	if args.Term > atomic.LoadInt64(&rf.currentTerm) {
@@ -200,40 +230,48 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
 	}
 	if atomic.LoadInt64(&rf.votedFor) == -1 {
-		//currentLogIndex := 0
-		//if len(rf.log)-1 >= 0 {
-		//	currentLogIndex = rf.log[currentLogIndex].Term
+		//lastLogIndex := int64(len(rf.log))
+		//var lastLogTerm int64 = -1
+		//if lastLogIndex != 0 {
+		//	lastLogTerm = rf.log[lastLogIndex-1].Term
 		//}
-		//if len(rf.log)-1 <= args.LastLogIndex && args.LastLogIndex >= currentLogIndex {
-		reply.VoteGranted = true
-		atomic.StoreInt64(&rf.votedFor, args.CandidateId)
-		rf.LastHeartBeat = time.Now()
-		//} else {
-		//reply.VoteGranted = false
-		//reply.IsExpired = true
-		//}
+		lastLogIndex := int64(len(rf.log))
+		lastLogTerm := rf.log.getEntryByIndex(lastLogIndex).Term
+		//当Candidate任期大等于本地节点任期，或term相同时Index大等于本地时即可vote
+		if args.LastLogTerm > lastLogTerm || (lastLogTerm == args.LastLogTerm && args.LastLogIndex >= lastLogIndex) {
+			//if args.LastLogTerm >= lastLogTerm && args.LastLogIndex >= lastLogIndex {
+			reply.VoteGranted = true
+			atomic.StoreInt64(&rf.votedFor, args.CandidateId)
+			rf.LastHeartBeat = time.Now()
+			//fmt.Println(args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
+			DPrintf("%v VotedFor %v", rf.me, args.CandidateId)
+		} else {
+			reply.VoteGranted = false
+			reply.IsExpired = true //Candidate的log是过时的
+			//fmt.Println(args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
+			DPrintf("Candidate%v's log is expired", args.CandidateId)
+		}
 	} else {
 		reply.VoteGranted = false
 		rf.LastHeartBeat = time.Now()
 	}
-	rf.mu.Unlock()
 }
 
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
-	Term         int64
-	LeaderId     int64
-	PrevLogIndex int64
-	PrevLogTerm  int64
-	//entries[]
+	Term              int64
+	LeaderId          int64
+	PrevLogIndex      int64
+	PrevLogTerm       int64
+	Entries           []Entry
 	LeaderCommitIndex int64
 }
 
 type AppendEntriesReply struct {
 	// Your data here (3A).
-	Term    int64
-	Success bool
-
+	Term      int64
+	Success   bool
+	IsKilled  bool
 	IsExpired bool
 }
 
@@ -242,22 +280,64 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.killed() {
+		reply.IsKilled = true
 		reply.Success = false
 		atomic.StoreInt64(&rf.votedFor, -1)
 		atomic.StoreInt32(&rf.status, Follower)
 		return
 	}
+
 	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
 		reply.IsExpired = true
 		reply.Term = atomic.LoadInt64(&rf.currentTerm)
 		reply.Success = false
 		return
 	}
-	atomic.StoreInt64(&rf.votedFor, args.LeaderId)
-	rf.LastHeartBeat = time.Now()
-	atomic.StoreInt64(&rf.currentTerm, args.Term)
+	if len(args.Entries) == 0 { //HeartBeat
+		atomic.StoreInt64(&rf.votedFor, args.LeaderId)
+		atomic.StoreInt32(&rf.status, Follower)
+		rf.LastHeartBeat = time.Now()
+		atomic.StoreInt64(&rf.currentTerm, args.Term)
+		reply.Success = true
+	} else {
+		rf.LastHeartBeat = time.Now()
+		DPrintf("%v get Entry from %v at term %v", rf.me, args.LeaderId, args.Term)
+		//如果PrevLogTerm与PrevLogIndex不匹配则nextIndex回退
+		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex).Term {
+			reply.Success = false
+			return
+		}
+		exceed := true
+		for i, entry := range args.Entries {
+			//if len(rf.log)-1 < int(args.PrevLogIndex)+i || rf.log[int(args.PrevLogIndex)+i].Term != entry.Term {
+			//	//切片覆盖
+			//	rf.log = append(rf.log[0:int(args.PrevLogIndex)+i], args.Entries[i:]...)
+			//	break
+			//}
+			//从这里开始出现不同，Raft是强Leader型算法，因此直接进行覆盖
+			if rf.log.getEntryByIndex(int64(i+1)+args.PrevLogIndex).Term != entry.Term {
+				rf.log = append(rf.log.getEntrySlice(1, int64(i+1)+args.PrevLogIndex), args.Entries[i:]...)
+				exceed = false
+				break
+			}
 
-	reply.Success = true
+		}
+		if exceed {
+			//删除不同的部分
+			rf.log = rf.log.getEntrySlice(1, int64(len(args.Entries))+args.PrevLogIndex)
+		}
+		reply.Success = true
+	}
+	//如果 leaderCommit>commitIndex，
+	//设置本地 commitIndex 为 leaderCommit 和最新日志索引中
+	//较小的一个。
+	if args.LeaderCommitIndex > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommitIndex
+		if int64(len(rf.log)) < rf.commitIndex {
+			rf.commitIndex = int64(len(rf.log))
+		}
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -320,15 +400,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 	} else {
 		rf.mu.Lock()
-		newEntry := Entry{
+		logEntry := Entry{
 			Command: command,
-			Term:    rf.currentTerm,
-			Index:   rf.commitIndex,
+			Term:    atomic.LoadInt64(&rf.currentTerm),
 		}
-		rf.log = append(rf.log, newEntry)
-		rf.LastLogCome <- true
+		rf.log = append(rf.log, logEntry)
+		DPrintf("Leader%v get new log:%v\n", rf.me, command)
+
+		index = len(rf.log)
 		rf.mu.Unlock()
 	}
+
 	return index, term, isLeader
 }
 
@@ -360,7 +442,7 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		timeoutTime := time.Now().Unix()
-		ms := 50 + (rand.Int63() % 300)
+		ms := 150 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.LastHeartBeat.Unix() < timeoutTime && atomic.LoadInt32(&rf.status) != Leader {
@@ -380,10 +462,10 @@ func (rf *Raft) Election() {
 	args := &RequestVoteArgs{
 		Term:         atomic.LoadInt64(&rf.currentTerm),
 		CandidateId:  rf.me,
-		LastLogIndex: int64(len(rf.log) - 1),
+		LastLogIndex: int64(len(rf.log)),
 	}
-	if args.LastLogIndex != -1 {
-		args.LastLogTerm = rf.log[args.LastLogIndex].Term
+	if args.LastLogIndex != 0 {
+		args.LastLogTerm = rf.log.getEntryByIndex(args.LastLogIndex).Term
 	} else {
 		args.LastLogTerm = 0
 	}
@@ -398,9 +480,8 @@ func (rf *Raft) Election() {
 			continue
 		}
 		reply := &RequestVoteReply{}
-		rf.ElectionSync.Add(1)
+		//rf.ElectionSync.Add(1)
 		go func(serverId int) {
-			defer rf.ElectionSync.Done()
 			if rf.sendRequestVote(serverId, args, reply) {
 				rf.mu.Lock()
 				//DPrintf("%v:%v", rf.me, *reply)
@@ -409,6 +490,7 @@ func (rf *Raft) Election() {
 					atomic.StoreInt64(&rf.votedFor, -1)
 					atomic.StoreInt64(&rf.currentTerm, reply.Term)
 					expired = true
+					//rf.ElectionSync.Done()
 					rf.mu.Unlock()
 					return
 				}
@@ -426,32 +508,28 @@ func (rf *Raft) Election() {
 			} else {
 				atomic.AddInt64(&currentPeerNum, -1)
 			}
-
+			//rf.ElectionSync.Done()
 		}(i)
 	}
 	time.Sleep(20 * time.Millisecond)
-	rf.ElectionSync.Wait()
+	//rf.ElectionSync.Wait()
 	if expired {
 		atomic.StoreInt32(&rf.status, Follower)
 	}
 	if atomic.LoadInt32(&rf.status) == Leader {
+		DPrintf("%v become Leader in term %v", rf.me, rf.currentTerm)
 		rf.DiscoverServers()
 	}
 }
 
 func (rf *Raft) DiscoverServers() {
-	var isNewEntry int32 = -1
-
 	for atomic.LoadInt32(&rf.status) == Leader && !rf.killed() {
-		rf.mu.Lock()
+		//rf.mu.Lock()
 		rf.LastHeartBeat = time.Now()
 		//DPrintf("%v %v", rf.currentTerm, rf.me)
-		args := &AppendEntriesArgs{
-			Term:              atomic.LoadInt64(&rf.currentTerm),
-			LeaderId:          rf.me,
-			LeaderCommitIndex: rf.commitIndex,
-		}
-		rf.mu.Unlock()
+
+		//rf.mu.Unlock()
+		lastLogIndex := int64(len(rf.log))
 		for i, _ := range rf.peers {
 			if atomic.LoadInt32(&rf.status) != Leader {
 				break
@@ -459,23 +537,139 @@ func (rf *Raft) DiscoverServers() {
 			if i == int(rf.me) {
 				continue
 			}
+			args := &AppendEntriesArgs{
+				Term:              atomic.LoadInt64(&rf.currentTerm),
+				LeaderId:          rf.me,
+				LeaderCommitIndex: rf.commitIndex,
+			}
 			reply := &AppendEntriesReply{}
-			//rf.ElectionSync.Add(1)
-			go func(serverId int) {
-				//defer rf.ElectionSync.Done()
-				if rf.sendAppendEntries(serverId, args, reply) {
-					if reply.IsExpired {
-						atomic.StoreInt64(&rf.currentTerm, reply.Term)
-						atomic.StoreInt32(&rf.status, Follower)
-						atomic.StoreInt64(&rf.votedFor, -1)
-						return
+			//lab2B
+			prevLogIndex := rf.nextIndex[i] - 1
+			if lastLogIndex == 0 {
+				args.PrevLogIndex = 0
+				args.PrevLogTerm = 0
+			} else {
+				args.PrevLogIndex = prevLogIndex
+				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex).Term
+			}
+			DPrintf("lastLogIndex:%v PrevLogIndex:%v", lastLogIndex, args.PrevLogIndex)
+			if lastLogIndex > args.PrevLogIndex {
+				DPrintf("Leader%v start AppendEntries to %v", rf.me, i)
+				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1)
+				args.Entries = entries
+				go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
+			} else {
+				//lab2A
+				go func(serverId int) {
+					if rf.sendAppendEntries(serverId, args, reply) {
+						if reply.IsExpired {
+							atomic.StoreInt64(&rf.currentTerm, reply.Term)
+							atomic.StoreInt32(&rf.status, Follower)
+							atomic.StoreInt64(&rf.votedFor, -1)
+							return
+						}
+					}
+
+				}(i)
+
+			}
+
+		}
+		ms := 201
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+
+}
+
+func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	reply := &AppendEntriesReply{}
+	if rf.sendAppendEntries(serverId, args, reply) {
+		if reply.IsKilled {
+			return
+		}
+		if reply.IsExpired {
+			atomic.StoreInt64(&rf.currentTerm, reply.Term)
+			atomic.StoreInt32(&rf.status, Follower)
+			atomic.StoreInt64(&rf.votedFor, -1)
+			return
+		}
+		//3.1 如果成功，更新nextIndex和matchIndex
+		if reply.Success {
+			rf.mu.Lock()
+			rf.nextIndex[serverId] = int64(len(rf.log)) + 1
+			rf.matchIndex[serverId] = int64(len(rf.log))
+			//fmt.Printf("N:%v commitIndex:%v\n", len(rf.log), rf.commitIndex)
+			for N := int64(len(rf.log)); N > atomic.LoadInt64(&rf.commitIndex) && rf.log.getEntryByIndex(N).Term == atomic.LoadInt64(&rf.currentTerm); N-- {
+				count := 1
+				for s, matchIndex := range rf.matchIndex {
+					if s == int(rf.me) {
+						continue
+					}
+					if matchIndex >= N {
+						count++
 					}
 				}
+				//fmt.Println(count)
+				//4.majority(matchIndex[i]>= N)（如果参与者大多数的最新日志的索引大于 N）
+				if count > len(rf.peers)/2 {
+					rf.commitIndex = N
+					break
+				}
+			}
+			rf.mu.Unlock()
+		} else {
+			//3.2 如果由于日志不一致而失败，减少 nextIndex 并重试
+			if rf.nextIndex[serverId] > 1 {
+				rf.nextIndex[serverId]--
+			}
 
-			}(i)
+			lastLogIndex := int64(len(rf.log))
+			args = &AppendEntriesArgs{
+				Term:              atomic.LoadInt64(&rf.currentTerm),
+				LeaderId:          rf.me,
+				LeaderCommitIndex: rf.commitIndex,
+			}
+			reply = &AppendEntriesReply{}
+			//lab2B
+			prevLogIndex := rf.nextIndex[serverId] - 1
+			if lastLogIndex == 0 {
+				args.PrevLogIndex = 0
+				args.PrevLogTerm = 0
+			} else {
+				args.PrevLogIndex = prevLogIndex
+				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex).Term
+			}
+			DPrintf("out-sync:Leader%v restart AppendEntries to %v", rf.me, serverId)
+			entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1)
+			args.Entries = entries
+			go rf.sendEntries(args, serverId) //由于涉及到多次调用，封装到函数中
 		}
-		ms := 101
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+	} else {
+		fmt.Println(serverId, "is disconn")
+	}
+}
+
+func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+		appliedMsgs := []ApplyMsg{}
+
+		if atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
+			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v\n", rf.me, rf.commitIndex, rf.lastApplied)
+			rf.lastApplied++
+
+			appliedMsgs = append(appliedMsgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log.getEntryByIndex(rf.lastApplied).Command,
+				CommandIndex: int(rf.lastApplied),
+			})
+		}
+
+		for _, msg := range appliedMsgs {
+			applyCh <- msg
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -499,20 +693,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.status = Follower
 	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.nextIndex = make([]int64, 0)
-	rf.nextIndex = make([]int64, 0)
-	rf.matchIndex = make([]int64, 0)
+	rf.LastHeartBeat = time.Now()
+	rf.ElectionSync = sync.WaitGroup{}
+	//rf.AppendEntriesSync = sync.WaitGroup{}
 	rf.log = make([]Entry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.LastHeartBeat = time.Now()
-	rf.LastLogCome = make(chan bool)
-	rf.ElectionSync = sync.WaitGroup{}
+	rf.nextIndex = make([]int64, len(rf.peers))
+	for i, _ := range rf.nextIndex {
+		rf.nextIndex[i] = 1
+	}
+	rf.matchIndex = make([]int64, len(rf.peers))
+	for i, _ := range rf.matchIndex {
+		rf.matchIndex[i] = 0
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.applyLogToStateMachine(applyCh)
 	return rf
 }

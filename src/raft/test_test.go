@@ -564,6 +564,7 @@ func TestBackup3B(t *testing.T) {
 	cfg.end()
 }
 
+// pass
 func TestCount3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
