@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	//	"bytes"
 	"math/rand"
@@ -293,6 +292,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	if rf.log.getEntryByIndex(int64(len(rf.log))).Term > args.Term {
+		reply.IsExpired = true
+		reply.Success = false
+		return
+	}
 	if len(args.Entries) == 0 { //HeartBeat
 		atomic.StoreInt64(&rf.votedFor, args.LeaderId)
 		atomic.StoreInt32(&rf.status, Follower)
@@ -500,7 +504,7 @@ func (rf *Raft) Election() {
 				if reply.VoteGranted && !expired {
 					atomic.AddInt64(&voteCount, 1)
 
-					if atomic.LoadInt64(&voteCount) > atomic.LoadInt64(&currentPeerNum)/2 && atomic.LoadInt32(&rf.status) == Candidate {
+					if atomic.LoadInt64(&voteCount) > int64(len(rf.peers))/2 /*atomic.LoadInt64(&currentPeerNum)/2*/ && atomic.LoadInt32(&rf.status) == Candidate {
 						atomic.StoreInt32(&rf.status, Leader)
 					}
 				}
@@ -552,9 +556,8 @@ func (rf *Raft) DiscoverServers() {
 				args.PrevLogIndex = prevLogIndex
 				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex).Term
 			}
-			DPrintf("lastLogIndex:%v PrevLogIndex:%v", lastLogIndex, args.PrevLogIndex)
 			if lastLogIndex > args.PrevLogIndex {
-				DPrintf("Leader%v start AppendEntries to %v", rf.me, i)
+				//DPrintf("Leader%v start AppendEntries to %v,lastLogIndex:%v PrevLogIndex:%v", rf.me, i, lastLogIndex, args.PrevLogIndex)
 				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1)
 				args.Entries = entries
 				go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
@@ -647,7 +650,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 			go rf.sendEntries(args, serverId) //由于涉及到多次调用，封装到函数中
 		}
 	} else {
-		fmt.Println(serverId, "is disconn")
+		//fmt.Println(serverId, "is disconn")
 	}
 }
 
@@ -655,7 +658,7 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 		appliedMsgs := []ApplyMsg{}
 
-		if atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
+		for atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
 			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v\n", rf.me, rf.commitIndex, rf.lastApplied)
 			rf.lastApplied++
 
@@ -664,11 +667,12 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 				Command:      rf.log.getEntryByIndex(rf.lastApplied).Command,
 				CommandIndex: int(rf.lastApplied),
 			})
+
+			for _, msg := range appliedMsgs {
+				applyCh <- msg
+			}
 		}
 
-		for _, msg := range appliedMsgs {
-			applyCh <- msg
-		}
 		time.Sleep(300 * time.Millisecond)
 	}
 }
