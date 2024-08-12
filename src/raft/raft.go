@@ -20,6 +20,7 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
+	"fmt"
 	"github.com/sasha-s/go-deadlock"
 	//	"bytes"
 	"math/rand"
@@ -100,6 +101,7 @@ func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
 		}
 	}
 	if index > int64(len(logEntries)) {
+		fmt.Println("wcesu", index, len(logEntries))
 		return &Entry{
 			Command: nil,
 			Term:    -1,
@@ -160,7 +162,7 @@ func (rf *Raft) persist() {
 
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
-	DPrintf("encode success")
+	//DPrintf("encode success")
 }
 
 // restore previously persisted state.
@@ -290,10 +292,10 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	// Your data here (3A).
-	Term      int64
-	Success   bool
-	IsKilled  bool
-	IsExpired bool
+	Term       int64
+	Success    bool
+	IsExpired  bool
+	LogExpired bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -301,7 +303,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.killed() {
-		reply.IsKilled = true
 		reply.Success = false
 		atomic.StoreInt64(&rf.votedFor, -1)
 		atomic.StoreInt32(&rf.status, Follower)
@@ -326,6 +327,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
 		reply.Success = true
 		rf.persist()
+		//3C add
+		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex).Term {
+			reply.Success = false
+			reply.LogExpired = true
+			return
+		}
 	} else {
 		rf.LastHeartBeat = time.Now()
 		DPrintf("%v get Entry from %v at term %v", rf.me, args.LeaderId, args.Term)
@@ -336,11 +343,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		exceed := true
 		for i, entry := range args.Entries {
-			//if len(rf.log)-1 < int(args.PrevLogIndex)+i || rf.log[int(args.PrevLogIndex)+i].Term != entry.Term {
-			//	//切片覆盖
-			//	rf.log = append(rf.log[0:int(args.PrevLogIndex)+i], args.Entries[i:]...)
-			//	break
-			//}
 			//从这里开始出现不同，Raft是强Leader型算法，因此直接进行覆盖
 			if rf.log.getEntryByIndex(int64(i+1)+args.PrevLogIndex).Term != entry.Term {
 				rf.log = append(rf.log.getEntrySlice(1, int64(i+1)+args.PrevLogIndex), args.Entries[i:]...)
@@ -351,7 +353,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if exceed {
 			//删除不同的部分
-			rf.log = rf.log.getEntrySlice(1, int64(len(args.Entries))+args.PrevLogIndex)
+			rf.log = rf.log.getEntrySlice(1, int64(len(args.Entries))+args.PrevLogIndex+1)
 		}
 		reply.Success = true
 		rf.persist()
@@ -360,9 +362,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//设置本地 commitIndex 为 leaderCommit 和最新日志索引中
 	//较小的一个。
 	if args.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommitIndex
-		if int64(len(rf.log)) < rf.commitIndex {
+		if int64(len(rf.log)) < args.LeaderCommitIndex {
 			rf.commitIndex = int64(len(rf.log))
+		} else {
+			rf.commitIndex = args.LeaderCommitIndex
 		}
 		rf.persist()
 	}
@@ -550,11 +553,11 @@ func (rf *Raft) Election() {
 	}
 	if atomic.LoadInt32(&rf.status) == Leader {
 		DPrintf("%v become Leader in term %v", rf.me, rf.currentTerm)
-		rf.DiscoverServers()
+		rf.AppendToServers()
 	}
 }
 
-func (rf *Raft) DiscoverServers() {
+func (rf *Raft) AppendToServers() {
 	for atomic.LoadInt32(&rf.status) == Leader && !rf.killed() {
 		//rf.mu.Lock()
 		rf.LastHeartBeat = time.Now()
@@ -600,6 +603,12 @@ func (rf *Raft) DiscoverServers() {
 							rf.persist()
 							return
 						}
+						if reply.LogExpired {
+							fmt.Println("log exp")
+							entries := rf.log.getEntrySlice(lastLogIndex, lastLogIndex+1)
+							args.Entries = entries
+							rf.sendEntries(args, i)
+						}
 					}
 
 				}(i)
@@ -618,9 +627,6 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 	//defer rf.mu.Unlock()
 	reply := &AppendEntriesReply{}
 	if rf.sendAppendEntries(serverId, args, reply) {
-		if reply.IsKilled {
-			return
-		}
 		if reply.IsExpired {
 			atomic.StoreInt64(&rf.currentTerm, reply.Term)
 			atomic.StoreInt32(&rf.status, Follower)
@@ -688,20 +694,18 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 
 func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
-		appliedMsgs := []ApplyMsg{}
 
 		for atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
 			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v\n", rf.me, rf.commitIndex, rf.lastApplied)
 			rf.lastApplied++
-			appliedMsgs = append(appliedMsgs, ApplyMsg{
+
+			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log.getEntryByIndex(rf.lastApplied).Command,
 				CommandIndex: int(rf.lastApplied),
-			})
-
-			for _, msg := range appliedMsgs {
-				applyCh <- msg
 			}
+			applyCh <- msg
+
 			rf.persist()
 		}
 
