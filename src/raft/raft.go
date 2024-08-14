@@ -101,7 +101,7 @@ func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
 		}
 	}
 	if index > int64(len(logEntries)) {
-		fmt.Println("wcesu", index, len(logEntries))
+		//fmt.Println("wcesu", index, len(logEntries))
 		return &Entry{
 			Command: nil,
 			Term:    -1,
@@ -296,6 +296,7 @@ type AppendEntriesReply struct {
 	Success    bool
 	IsExpired  bool
 	LogExpired bool
+	Figure8    bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -327,12 +328,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
 		reply.Success = true
 		rf.persist()
-		//3C add
-		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex).Term {
-			reply.Success = false
-			reply.LogExpired = true
-			return
-		}
+		//3C add(forbid)
+		//if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex).Term {
+		//	reply.Success = false
+		//	reply.LogExpired = true
+		//	return
+		//}
 	} else {
 		rf.LastHeartBeat = time.Now()
 		DPrintf("%v get Entry from %v at term %v", rf.me, args.LeaderId, args.Term)
@@ -355,8 +356,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			//删除不同的部分
 			rf.log = rf.log.getEntrySlice(1, int64(len(args.Entries))+args.PrevLogIndex+1)
 		}
-		reply.Success = true
 		rf.persist()
+		reply.Success = true
+		if rf.log.getEntryByIndex(int64(len(rf.log))).Term < rf.currentTerm {
+			reply.Figure8 = true
+		}
+
 	}
 	//如果 leaderCommit>commitIndex，
 	//设置本地 commitIndex 为 leaderCommit 和最新日志索引中
@@ -545,7 +550,7 @@ func (rf *Raft) Election() {
 			//rf.ElectionSync.Done()
 		}(i)
 	}
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(40 * time.Millisecond)
 	//rf.ElectionSync.Wait()
 	if expired {
 		atomic.StoreInt32(&rf.status, Follower)
@@ -636,11 +641,16 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 		//3.1 如果成功，更新nextIndex和matchIndex
 		if reply.Success {
 			rf.mu.Lock()
+			if reply.Figure8 {
+				rf.NextIndex[serverId] = int64(len(rf.log)) + 1
+				rf.mu.Unlock()
+				return
+			}
+
 			rf.NextIndex[serverId] = int64(len(rf.log)) + 1
 			//rf.nextIndex[serverId] += int64(len(args.Entries))
 			//rf.matchIndex[serverId] = int64(len(rf.log))
 			rf.MatchIndex[serverId] = args.PrevLogIndex + int64(len(args.Entries))
-			rf.persist()
 			for N := int64(len(rf.log)); N > atomic.LoadInt64(&rf.commitIndex) && rf.log.getEntryByIndex(N).Term == atomic.LoadInt64(&rf.currentTerm); N-- {
 				count := 1
 				for s, matchIndex := range rf.MatchIndex {
@@ -654,7 +664,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 				//4.majority(matchIndex[i]>= N)（如果参与者大多数的最新日志的索引大于 N）
 				if count > len(rf.peers)/2 {
 					rf.commitIndex = N
-					rf.persist()
+					//rf.persist()
 					break
 				}
 			}
@@ -663,7 +673,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 			//3.2 如果由于日志不一致而失败，减少 nextIndex 并重试
 			if rf.NextIndex[serverId] > 1 {
 				rf.NextIndex[serverId]--
-				rf.persist()
+				//rf.persist()
 			}
 
 			lastLogIndex := int64(len(rf.log))
@@ -694,6 +704,10 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 
 func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
+		if rf.log.getEntryByIndex(rf.commitIndex).Term < rf.currentTerm {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
 
 		for atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
 			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v\n", rf.me, rf.commitIndex, rf.lastApplied)
@@ -706,10 +720,10 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 			}
 			applyCh <- msg
 
-			rf.persist()
+			//rf.persist()
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
