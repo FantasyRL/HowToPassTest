@@ -101,7 +101,6 @@ func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
 		}
 	}
 	if index > int64(len(logEntries)) {
-		//fmt.Println("wcesu", index, len(logEntries))
 		return &Entry{
 			Command: nil,
 			Term:    -1,
@@ -205,10 +204,11 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-// the service says it has created a snapshot that has
+// Snapshot the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// 服务可以调用该函数来传递其状态的序列化快照
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 
@@ -377,6 +377,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+type InstallSnapshotArgs struct {
+	Term              int64
+	LeaderId          int64
+	LastIncludedIndex int64
+	LastIncludedTerm  int64
+	Offset            int64  //快照中块的字节偏移量
+	Data              []byte //数据块，从偏移量开始存储
+	Done              bool   //是否是最后一个块文件
+}
+type InstallSnapshotReply struct {
+	Term    int64
+	Success bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
+		reply.Success = false
+		return
+	}
+
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -410,6 +434,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
