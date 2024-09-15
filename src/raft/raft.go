@@ -77,6 +77,8 @@ type Raft struct {
 	NextIndex   []int64
 	MatchIndex  []int64
 	//AppendEntriesSync sync.WaitGroup
+	//3D
+	lastIncludedIndex int64 //offset
 }
 
 const (
@@ -93,7 +95,8 @@ type Entry struct {
 type LogEntries []Entry
 
 // get entry
-func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
+func (logEntries LogEntries) getEntryByIndex(index int64, lastIncludedIndex int64) *Entry {
+	index -= lastIncludedIndex
 	if index <= 0 {
 		return &Entry{
 			Command: nil,
@@ -110,7 +113,9 @@ func (logEntries LogEntries) getEntryByIndex(index int64) *Entry {
 }
 
 // get slice
-func (logEntries LogEntries) getEntrySlice(startIndex, endIndex int64) LogEntries {
+func (logEntries LogEntries) getEntrySlice(startIndex, endIndex int64, lastIncludedIndex int64) LogEntries {
+	startIndex -= lastIncludedIndex
+	endIndex -= lastIncludedIndex
 	if startIndex <= 0 {
 		startIndex = 1
 	}
@@ -142,8 +147,10 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 // before you've implemented snapshots, you should pass nil as the
 // second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
+// after you've implemented snapshots,
 // (or nil if there's not yet a snapshot).
+//
+//todo:pass the current snapshot
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
@@ -154,14 +161,24 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	//e.Encode(rf.commitIndex)
-	//e.Encode(rf.lastApplied)
-	//e.Encode(rf.MatchIndex)
-	//e.Encode(rf.NextIndex)
 
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
 	//DPrintf("encode success")
+}
+func (rf *Raft) persistSnapshot(snapshot []byte) {
+	// Your code here (3C).
+	// Example:
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, snapshot)
 }
 
 // restore previously persisted state.
@@ -187,31 +204,32 @@ func (rf *Raft) readPersist(data []byte) {
 	var log LogEntries
 	var currentTerm int64
 	var votedFor int64
-	//var commitIndex int64
-	//var lastApplied int64
-	//var NextIndex []int64
-	//var MatchIndex []int64
+
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
 		DPrintf("%v:decode error:\n%v\n", rf.me, d.Decode(&log))
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
-		//rf.commitIndex = commitIndex
-		//rf.lastApplied = lastApplied
-		//rf.NextIndex = NextIndex
-		//rf.MatchIndex = MatchIndex
 	}
 }
 
-// Snapshot the service says it has created a snapshot that has
+// the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
-// 服务可以调用该函数来传递其状态的序列化快照
+// 函数目的是删除快照之前的日志，保证日志量不多于2000
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index >= len(rf.log) {
+		return
+	}
+	rf.log = rf.log.getEntrySlice(int64(index)+1, int64(len(rf.log))+rf.lastIncludedIndex, rf.lastIncludedIndex)
+	atomic.StoreInt64(&rf.lastIncludedIndex, int64(index))
+	DPrintf("snapshot:%v", rf.log)
+	rf.persistSnapshot(snapshot)
 }
 
 type RequestVoteArgs struct {
@@ -260,8 +278,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}
 	if atomic.LoadInt64(&rf.votedFor) == -1 {
-		lastLogIndex := int64(len(rf.log))
-		lastLogTerm := rf.log.getEntryByIndex(lastLogIndex).Term
+		lastLogIndex := int64(len(rf.log)) + rf.lastIncludedIndex
+		lastLogTerm := rf.log.getEntryByIndex(lastLogIndex, rf.lastIncludedIndex).Term
 		//当Candidate任期大等于本地节点任期，或term相同时Index大等于本地时即可vote
 		if args.LastLogTerm > lastLogTerm || (lastLogTerm == args.LastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			reply.VoteGranted = true
@@ -316,7 +334,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if rf.log.getEntryByIndex(int64(len(rf.log))).Term > args.Term {
+	if rf.log.getEntryByIndex(int64(len(rf.log))+rf.lastIncludedIndex, rf.lastIncludedIndex).Term > args.Term {
 		reply.IsExpired = true
 		reply.Success = false
 		return
@@ -338,15 +356,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.LastHeartBeat = time.Now()
 		DPrintf("%v get Entry from %v at term %v", rf.me, args.LeaderId, args.Term)
 		//如果PrevLogTerm与PrevLogIndex不匹配则nextIndex回退
-		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex).Term {
+		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex, rf.lastIncludedIndex).Term {
 			reply.Success = false
 			return
 		}
 		exceed := true
 		for i, entry := range args.Entries {
 			//从这里开始出现不同，Raft是强Leader型算法，因此直接进行覆盖
-			if rf.log.getEntryByIndex(int64(i+1)+args.PrevLogIndex).Term != entry.Term {
-				rf.log = append(rf.log.getEntrySlice(1, int64(i+1)+args.PrevLogIndex), args.Entries[i:]...)
+			if rf.log.getEntryByIndex(int64(i+1)+args.PrevLogIndex, rf.lastIncludedIndex).Term != entry.Term {
+				rf.log = append(rf.log.getEntrySlice(1+rf.lastIncludedIndex, int64(i+1)+args.PrevLogIndex, rf.lastIncludedIndex), args.Entries[i:]...)
 				exceed = false
 				break
 			}
@@ -354,11 +372,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if exceed {
 			//删除不同的部分
-			rf.log = rf.log.getEntrySlice(1, int64(len(args.Entries))+args.PrevLogIndex+1)
+			rf.log = rf.log.getEntrySlice(1+rf.lastIncludedIndex, int64(len(args.Entries))+args.PrevLogIndex+1, rf.lastIncludedIndex)
 		}
 		rf.persist()
 		reply.Success = true
-		if rf.log.getEntryByIndex(int64(len(rf.log))).Term < rf.currentTerm {
+		if rf.log.getEntryByIndex(int64(len(rf.log))+rf.lastIncludedIndex, rf.lastIncludedIndex).Term < rf.currentTerm {
 			reply.Figure8 = true
 		}
 
@@ -382,9 +400,9 @@ type InstallSnapshotArgs struct {
 	LeaderId          int64
 	LastIncludedIndex int64
 	LastIncludedTerm  int64
-	Offset            int64  //快照中块的字节偏移量
-	Data              []byte //数据块，从偏移量开始存储
-	Done              bool   //是否是最后一个块文件
+	//Offset            int64  //快照中块的字节偏移量 无需实现
+	Data []byte //数据块，从偏移量开始存储
+	Done bool   //是否是最后一个块文件
 }
 type InstallSnapshotReply struct {
 	Term    int64
@@ -472,7 +490,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		DPrintf("Leader%v get new log:%v\n", rf.me, command)
 
-		index = len(rf.log)
+		index = len(rf.log) + int(rf.lastIncludedIndex)
 		rf.mu.Unlock()
 	}
 
@@ -528,10 +546,10 @@ func (rf *Raft) Election() {
 	args := &RequestVoteArgs{
 		Term:         atomic.LoadInt64(&rf.currentTerm),
 		CandidateId:  rf.me,
-		LastLogIndex: int64(len(rf.log)),
+		LastLogIndex: int64(len(rf.log)) + rf.lastIncludedIndex,
 	}
 	if args.LastLogIndex != 0 {
-		args.LastLogTerm = rf.log.getEntryByIndex(args.LastLogIndex).Term
+		args.LastLogTerm = rf.log.getEntryByIndex(args.LastLogIndex, rf.lastIncludedIndex).Term
 	} else {
 		args.LastLogTerm = 0
 	}
@@ -596,7 +614,7 @@ func (rf *Raft) AppendToServers() {
 		//DPrintf("%v %v", rf.currentTerm, rf.me)
 
 		//rf.mu.Unlock()
-		lastLogIndex := int64(len(rf.log))
+		lastLogIndex := int64(len(rf.log)) + rf.lastIncludedIndex
 		for i, _ := range rf.peers {
 			if atomic.LoadInt32(&rf.status) != Leader {
 				break
@@ -617,11 +635,11 @@ func (rf *Raft) AppendToServers() {
 				args.PrevLogTerm = 0
 			} else {
 				args.PrevLogIndex = prevLogIndex
-				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex).Term
+				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex, rf.lastIncludedIndex).Term
 			}
 			if lastLogIndex > args.PrevLogIndex {
 				//DPrintf("Leader%v start AppendEntries to %v,lastLogIndex:%v PrevLogIndex:%v", rf.me, i, lastLogIndex, args.PrevLogIndex)
-				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1)
+				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
 				args.Entries = entries
 				go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
 			} else {
@@ -635,9 +653,10 @@ func (rf *Raft) AppendToServers() {
 							rf.persist()
 							return
 						}
+						//forbid
 						if reply.LogExpired {
 							fmt.Println("log exp")
-							entries := rf.log.getEntrySlice(lastLogIndex, lastLogIndex+1)
+							entries := rf.log.getEntrySlice(lastLogIndex, lastLogIndex+1, rf.lastIncludedIndex)
 							args.Entries = entries
 							rf.sendEntries(args, i)
 						}
@@ -669,16 +688,16 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 		if reply.Success {
 			rf.mu.Lock()
 			if reply.Figure8 {
-				rf.NextIndex[serverId] = int64(len(rf.log)) + 1
+				rf.NextIndex[serverId] = int64(len(rf.log)) + rf.lastIncludedIndex + 1
 				rf.mu.Unlock()
 				return
 			}
 
-			rf.NextIndex[serverId] = int64(len(rf.log)) + 1
+			rf.NextIndex[serverId] = int64(len(rf.log)) + 1 + rf.lastIncludedIndex
 			//rf.nextIndex[serverId] += int64(len(args.Entries))
 			//rf.matchIndex[serverId] = int64(len(rf.log))
 			rf.MatchIndex[serverId] = args.PrevLogIndex + int64(len(args.Entries))
-			for N := int64(len(rf.log)); N > atomic.LoadInt64(&rf.commitIndex) && rf.log.getEntryByIndex(N).Term == atomic.LoadInt64(&rf.currentTerm); N-- {
+			for N := int64(len(rf.log)) + rf.lastIncludedIndex; N > atomic.LoadInt64(&rf.commitIndex) && rf.log.getEntryByIndex(N, rf.lastIncludedIndex).Term == atomic.LoadInt64(&rf.currentTerm); N-- {
 				count := 1
 				for s, matchIndex := range rf.MatchIndex {
 					if s == int(rf.me) {
@@ -703,7 +722,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 				//rf.persist()
 			}
 
-			lastLogIndex := int64(len(rf.log))
+			lastLogIndex := int64(len(rf.log)) + rf.lastIncludedIndex
 			args = &AppendEntriesArgs{
 				Term:              atomic.LoadInt64(&rf.currentTerm),
 				LeaderId:          rf.me,
@@ -717,10 +736,10 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 				args.PrevLogTerm = 0
 			} else {
 				args.PrevLogIndex = prevLogIndex
-				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex).Term
+				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex, rf.lastIncludedIndex).Term
 			}
 			//DPrintf("out-sync:Leader%v restart AppendEntries to %v", rf.me, serverId)
-			entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1)
+			entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
 			args.Entries = entries
 			go rf.sendEntries(args, serverId) //由于涉及到多次调用，封装到函数中
 		}
@@ -731,7 +750,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 
 func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
-		if rf.log.getEntryByIndex(rf.commitIndex).Term < rf.currentTerm {
+		if rf.log.getEntryByIndex(rf.commitIndex, rf.lastIncludedIndex).Term < rf.currentTerm {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
@@ -742,11 +761,10 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 
 			msg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log.getEntryByIndex(rf.lastApplied).Command,
+				Command:      rf.log.getEntryByIndex(rf.lastApplied, rf.lastIncludedIndex).Command,
 				CommandIndex: int(rf.lastApplied),
 			}
 			applyCh <- msg
-
 			//rf.persist()
 		}
 
@@ -781,6 +799,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.NextIndex = make([]int64, len(rf.peers))
+	rf.lastIncludedIndex = 0
 	for i, _ := range rf.NextIndex {
 		rf.NextIndex[i] = 1
 	}
