@@ -149,8 +149,6 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots,
 // (or nil if there's not yet a snapshot).
-//
-//todo:pass the current snapshot
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
@@ -166,6 +164,8 @@ func (rf *Raft) persist() {
 	rf.persister.Save(raftstate, nil)
 	//DPrintf("encode success")
 }
+
+// with snapshot
 func (rf *Raft) persistSnapshot(snapshot []byte) {
 	// Your code here (3C).
 	// Example:
@@ -223,13 +223,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if index >= len(rf.log) {
+	if index-int(rf.lastIncludedIndex) >= len(rf.log) {
 		return
 	}
-	rf.log = rf.log.getEntrySlice(int64(index)+1, int64(len(rf.log))+rf.lastIncludedIndex, rf.lastIncludedIndex)
+	rf.log = rf.log.getEntrySlice(int64(index)+1, int64(len(rf.log))+rf.lastIncludedIndex+1, rf.lastIncludedIndex)
 	atomic.StoreInt64(&rf.lastIncludedIndex, int64(index))
-	DPrintf("snapshot:%v", rf.log)
-	rf.persistSnapshot(snapshot)
+	DPrintf("lastIncludedIndex:%v noSnapshot:%v", rf.lastIncludedIndex, rf.log)
+	//rf.persistSnapshot(snapshot)
 }
 
 type RequestVoteArgs struct {
@@ -385,8 +385,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//设置本地 commitIndex 为 leaderCommit 和最新日志索引中
 	//较小的一个。
 	if args.LeaderCommitIndex > rf.commitIndex {
-		if int64(len(rf.log)) < args.LeaderCommitIndex {
-			rf.commitIndex = int64(len(rf.log))
+		if int64(len(rf.log))+rf.lastIncludedIndex < args.LeaderCommitIndex {
+			rf.commitIndex = int64(len(rf.log)) + rf.lastIncludedIndex
 		} else {
 			rf.commitIndex = args.LeaderCommitIndex
 		}
@@ -756,7 +756,7 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 		}
 
 		for atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
-			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v\n", rf.me, rf.commitIndex, rf.lastApplied)
+			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v,msg=%v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log.getEntryByIndex(rf.lastApplied, rf.lastIncludedIndex).Command)
 			rf.lastApplied++
 
 			msg := ApplyMsg{
