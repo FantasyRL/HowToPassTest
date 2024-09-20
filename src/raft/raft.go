@@ -79,6 +79,9 @@ type Raft struct {
 	//AppendEntriesSync sync.WaitGroup
 	//3D
 	lastIncludedIndex int64 //offset
+	lastIncludedTerm  int64
+	needSnapshot      int64
+	applyCh           chan ApplyMsg
 }
 
 const (
@@ -222,14 +225,38 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if index-int(rf.lastIncludedIndex) >= len(rf.log) {
+	if index-int(rf.lastIncludedIndex) >= len(rf.log) || rf.lastIncludedIndex > int64(index) {
+		rf.mu.Unlock()
 		return
 	}
+	atomic.StoreInt64(&rf.lastIncludedTerm, rf.log.getEntryByIndex(int64(index), rf.lastIncludedIndex).Term)
 	rf.log = rf.log.getEntrySlice(int64(index)+1, int64(len(rf.log))+rf.lastIncludedIndex+1, rf.lastIncludedIndex)
 	atomic.StoreInt64(&rf.lastIncludedIndex, int64(index))
-	DPrintf("lastIncludedIndex:%v noSnapshot:%v", rf.lastIncludedIndex, rf.log)
-	//rf.persistSnapshot(snapshot)
+
+	DPrintf("raft:%v lastIncludedIndex:%v noSnapshot:%v", rf.me, rf.lastIncludedIndex, rf.log)
+
+	//persist and apply snapshot
+	rf.persistSnapshot(snapshot)
+	if int64(index) > rf.commitIndex {
+		rf.commitIndex = int64(index)
+	}
+	if int64(index) > rf.lastApplied { //lastApplied也需要更新
+		rf.lastApplied = int64(index)
+	}
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  int(rf.lastIncludedTerm),
+		SnapshotIndex: int(rf.lastIncludedIndex),
+	}
+
+	rf.mu.Unlock()
+
+	rf.applyCh <- msg
+	DPrintf("Raft%v applySnapshot,commitIndex=%v,lastApplied=%v,other logs=%v", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+	//rf.applySnapshot(snapshot)
+
 }
 
 type RequestVoteArgs struct {
@@ -300,12 +327,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
-	Term              int64
-	LeaderId          int64
-	PrevLogIndex      int64
-	PrevLogTerm       int64
-	Entries           []Entry
-	LeaderCommitIndex int64
+	Term                    int64
+	LeaderId                int64
+	PrevLogIndex            int64
+	PrevLogTerm             int64
+	Entries                 []Entry
+	LeaderCommitIndex       int64
+	LeaderLastIncludedIndex int64 //3D
 }
 
 type AppendEntriesReply struct {
@@ -355,6 +383,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		rf.LastHeartBeat = time.Now()
 		DPrintf("%v get Entry from %v at term %v", rf.me, args.LeaderId, args.Term)
+
 		//如果PrevLogTerm与PrevLogIndex不匹配则nextIndex回退
 		if args.PrevLogTerm == -1 || args.PrevLogTerm != rf.log.getEntryByIndex(args.PrevLogIndex, rf.lastIncludedIndex).Term {
 			reply.Success = false
@@ -401,22 +430,64 @@ type InstallSnapshotArgs struct {
 	LastIncludedIndex int64
 	LastIncludedTerm  int64
 	//Offset            int64  //快照中块的字节偏移量 无需实现
-	Data []byte //数据块，从偏移量开始存储
-	Done bool   //是否是最后一个块文件
+	Data []byte //快照，无需实现偏移啥的
+	//Done bool   //是否是最后一个块文件，无需实现
 }
 type InstallSnapshotReply struct {
 	Term    int64
 	Success bool
 }
 
+// 如果领导者没有跟随者所需的日志条目来使其赶上，则发送InstallSnapshot RPC。
+// 在单个InstallSnapshot RPC中发送整个快照。不要实现图13中分割快照的偏移机制。
+// leader 将会使用一种叫做 InstallSnapshot 新的
+// RPC 来拷贝快照到那些远远落后的机器。
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if args.Term < atomic.LoadInt64(&rf.currentTerm) {
 		reply.Success = false
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 
+	atomic.StoreInt64(&rf.votedFor, args.LeaderId)
+	atomic.StoreInt32(&rf.status, Follower)
+	rf.LastHeartBeat = time.Now()
+	atomic.StoreInt64(&rf.currentTerm, args.Term)
+	rf.persist()
+
+	//进行日志修剪
+	index := args.LastIncludedIndex
+	atomic.StoreInt64(&rf.lastIncludedTerm, rf.log.getEntryByIndex(index, rf.lastIncludedIndex).Term)
+	if index-rf.lastIncludedIndex >= int64(len(rf.log)) {
+		rf.log = LogEntries{}
+	} else {
+		rf.log = rf.log.getEntrySlice(int64(index)+1, int64(len(rf.log))+rf.lastIncludedIndex+1, rf.lastIncludedIndex)
+	}
+	atomic.StoreInt64(&rf.lastIncludedIndex, index)
+
+	//apply snapshot
+	rf.persistSnapshot(args.Data) //直接覆盖
+	if index > rf.commitIndex {
+		rf.commitIndex = index
+	}
+	if index > rf.lastApplied { //lastApplied也需要更新
+		rf.lastApplied = index
+	}
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  int(rf.lastIncludedTerm),
+		SnapshotIndex: int(rf.lastIncludedIndex),
+	}
+
+	rf.mu.Unlock()
+	//rf.applySnapshot(args.Data)
+
+	rf.applyCh <- msg
+	DPrintf("Raft%v applySnapshot,commitIndex=%v,lastApplied=%v,other logs=%v", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -639,11 +710,18 @@ func (rf *Raft) AppendToServers() {
 			}
 			if lastLogIndex > args.PrevLogIndex {
 				//DPrintf("Leader%v start AppendEntries to %v,lastLogIndex:%v PrevLogIndex:%v", rf.me, i, lastLogIndex, args.PrevLogIndex)
-				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
-				args.Entries = entries
-				go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
+				//entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
+				//args.Entries = entries
+				//go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
+				if prevLogIndex-rf.lastIncludedIndex-1 < 0 && prevLogIndex != 0 {
+					rf.sendSnapshot(i)
+				} else {
+					entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
+					args.Entries = entries
+					go rf.sendEntries(args, i) //由于涉及到多次调用，封装到函数中
+				}
 			} else {
-				//lab2A
+				//lab3A
 				go func(serverId int) {
 					if rf.sendAppendEntries(serverId, args, reply) {
 						if reply.IsExpired {
@@ -667,7 +745,7 @@ func (rf *Raft) AppendToServers() {
 			}
 
 		}
-		ms := 201
+		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 
@@ -719,7 +797,6 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 			//3.2 如果由于日志不一致而失败，减少 nextIndex 并重试
 			if rf.NextIndex[serverId] > 1 {
 				rf.NextIndex[serverId]--
-				//rf.persist()
 			}
 
 			lastLogIndex := int64(len(rf.log)) + rf.lastIncludedIndex
@@ -729,7 +806,7 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 				LeaderCommitIndex: rf.commitIndex,
 			}
 			reply = &AppendEntriesReply{}
-			//lab2B
+			//lab3B
 			prevLogIndex := rf.NextIndex[serverId] - 1
 			if lastLogIndex == 0 {
 				args.PrevLogIndex = 0
@@ -738,25 +815,43 @@ func (rf *Raft) sendEntries(args *AppendEntriesArgs, serverId int) {
 				args.PrevLogIndex = prevLogIndex
 				args.PrevLogTerm = rf.log.getEntryByIndex(prevLogIndex, rf.lastIncludedIndex).Term
 			}
-			//DPrintf("out-sync:Leader%v restart AppendEntries to %v", rf.me, serverId)
-			entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
-			args.Entries = entries
-			go rf.sendEntries(args, serverId) //由于涉及到多次调用，封装到函数中
+
+			//todo:lab3d
+			//此时leader已删除下条要发给参与者的日志
+			if prevLogIndex-rf.lastIncludedIndex-1 < 0 && prevLogIndex != 0 {
+				DPrintf("installSnapshot:Leader%v restart installSnapshot for %v", rf.me, serverId)
+				rf.sendSnapshot(serverId)
+			} else {
+				DPrintf("out-sync:Leader%v restart AppendEntries to %v", rf.me, serverId)
+				entries := rf.log.getEntrySlice(prevLogIndex+1, lastLogIndex+1, rf.lastIncludedIndex)
+				args.Entries = entries
+				go rf.sendEntries(args, serverId) //由于涉及到多次调用，封装到函数中
+			}
 		}
 	} else {
 		//fmt.Println(serverId, "is disconn")
 	}
 }
 
-func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
+func (rf *Raft) sendSnapshot(serverId int) {
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	reply := new(InstallSnapshotReply)
+	rf.sendInstallSnapshot(serverId, args, reply)
+}
+
+func (rf *Raft) applyLogToStateMachine() {
 	for !rf.killed() {
 		if rf.log.getEntryByIndex(rf.commitIndex, rf.lastIncludedIndex).Term < rf.currentTerm {
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-
 		for atomic.LoadInt64(&rf.commitIndex) > atomic.LoadInt64(&rf.lastApplied) {
-			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v,msg=%v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log.getEntryByIndex(rf.lastApplied, rf.lastIncludedIndex).Command)
 			rf.lastApplied++
 
 			msg := ApplyMsg{
@@ -764,12 +859,26 @@ func (rf *Raft) applyLogToStateMachine(applyCh chan ApplyMsg) {
 				Command:      rf.log.getEntryByIndex(rf.lastApplied, rf.lastIncludedIndex).Command,
 				CommandIndex: int(rf.lastApplied),
 			}
-			applyCh <- msg
+			rf.applyCh <- msg
+			DPrintf("Raft%v applyLogToStateMachine,commitIndex=%v,lastApplied=%v,msg=%v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log.getEntryByIndex(rf.lastApplied, rf.lastIncludedIndex).Command)
 			//rf.persist()
 		}
 
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func (rf *Raft) applySnapshot(data []byte) {
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotTerm:  int(rf.lastIncludedTerm),
+		SnapshotIndex: int(rf.lastIncludedIndex),
+	}
+	DPrintf("Raft%v applySnapshot,commitIndex=%v,lastApplied=%v,other logs=%v", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+	rf.applyCh <- msg
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -800,6 +909,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.NextIndex = make([]int64, len(rf.peers))
 	rf.lastIncludedIndex = 0
+	rf.applyCh = applyCh
 	for i, _ := range rf.NextIndex {
 		rf.NextIndex[i] = 1
 	}
@@ -812,6 +922,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persist()
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.applyLogToStateMachine(applyCh)
+	go rf.applyLogToStateMachine()
 	return rf
 }
