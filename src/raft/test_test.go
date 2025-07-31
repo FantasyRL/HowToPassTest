@@ -8,10 +8,8 @@ package raft
 // test with the original before submitting.
 //
 
-import (
-	"fmt"
-	"testing"
-)
+import "testing"
+import "fmt"
 import "time"
 import "math/rand"
 import "sync/atomic"
@@ -564,7 +562,6 @@ func TestBackup3B(t *testing.T) {
 	cfg.end()
 }
 
-// pass
 func TestCount3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
