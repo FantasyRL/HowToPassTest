@@ -357,6 +357,7 @@ func (cfg *config) connect(i int) {
 	// fmt.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
+	DPrintf("[BREAK_EVENT][CONNECT] server %v connected", i)
 
 	// outgoing ClientEnds
 	for j := 0; j < cfg.n; j++ {
@@ -380,6 +381,7 @@ func (cfg *config) disconnect(i int) {
 	// fmt.Printf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
+	DPrintf("[BREAK_EVENT][DISCONNECT] server %v disconnected", i)
 
 	// outgoing ClientEnds
 	for j := 0; j < cfg.n; j++ {
