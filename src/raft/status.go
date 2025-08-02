@@ -45,6 +45,11 @@ func (rf *Raft) becomeCandidate() {
 
 func (rf *Raft) becomeLeader() {
 	if !rf.workerStatus.Equal(LeaderStatus) {
+		// leader的可变状态（每次选举后重新初始化）
+		for i := range rf.peers {
+			rf.nextIndex[i] = int(rf.lastLogIndex.Load() + 1)
+			rf.matchIndex[i] = 0 // 表示还没有匹配的日志
+		}
 		DPrintf("[LEADER_ELECTIONED] %d become leader, term %d", rf.me, rf.currentTerm.Load())
 		rf.workerStatus.Set(LeaderStatus)
 		go func() {
@@ -52,7 +57,7 @@ func (rf *Raft) becomeLeader() {
 				if rf.killed() || !rf.workerStatus.Equal(LeaderStatus) {
 					return
 				}
-				rf.sendHeartbeats()
+				rf.sendHeartbeatsAndLogEntries()
 				time.Sleep(50 * time.Millisecond) // 50ms < electionTimeoutMin(300ms)
 			}
 		}()
