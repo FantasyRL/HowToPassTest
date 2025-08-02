@@ -235,7 +235,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			DPrintf("[RequestVote] %d vote for %d, term %d", rf.me, args.CandidateId, args.Term)
 		} else {
 			reply.VoteGranted = false
-			//DPrintf("[RequestVote] %d reject vote for %d,expected log term %d, index %d, but got %d, %d", rf.me, args.CandidateId, lastLogTerm, lastLogIndex, args.LastLogTerm, args.LastLogIndex)
+			DPrintf("[RequestVote] %d reject vote for %d,expected log term %d, index %d, but got %d, %d", rf.me, args.CandidateId, lastLogTerm, lastLogIndex, args.LastLogTerm, args.LastLogIndex)
 		}
 	} else {
 		reply.VoteGranted = false
@@ -276,9 +276,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term        int64 // leader's term
-	LeaderId    int   // so follower can redirect clients
-	CommitIndex int64 // leader's commitIndex, 用于follower更新自己的commitIndex(心跳时使用)
+	Term     int64 // leader's term
+	LeaderId int   // so follower can redirect clients
+	//CommitIndex int64 // leader's commitIndex, 用于follower更新自己的commitIndex(心跳时使用)
 	// 3B
 	AppendArgs *AppendEntriesAppendArgs // 用于追加日志条目
 }
@@ -312,46 +312,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.becomeFollower(args.Term)
 	}
 	// 如果自己不存在索引、任期和 prevLogIndex、prevLogItem 匹配的日志返回 false
-	if args.AppendArgs != nil {
-		entry := rf.logEntries.Find(args.AppendArgs.PrevLogIndex)
-		// 不存在这个日志，说明缺日志，要更往前的日志
-		if entry == nil {
-			reply.Term = rf.currentTerm.Load()
-			reply.Success = false
-			//reply.ConflictTerm = -1
-			//reply.ConflictIndex = rf.lastLogIndex.Load() + 1 // 让leader知道要回退到哪里
-			return
-		}
-		// 如果存在这个日志，但是任期不匹配，说明日志不一致
-		if entry.Term != args.AppendArgs.PrevLogTerm {
-			// 删除这条日志及所有后继日志,和leader拿更往前的日志来校验
-			rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex)
-			rf.lastLogIndex.Store(args.AppendArgs.PrevLogIndex - 1)
-			//conflictTerm := entry.Term
-			// 告诉leader拿当前冲突term之前一个term的日志索引
-			//first := args.AppendArgs.PrevLogIndex
-			//for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
-			//	first--
-			//}
-			reply.Term = rf.currentTerm.Load()
-			reply.Success = false
-			//reply.ConflictTerm = conflictTerm
-			//reply.ConflictIndex = first // 让leader知道下次的nextIndex
-			return
-		}
-		// 如果存在这个日志，且任期匹配，说明日志一致,追加日志
-		rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex + 1)
-		rf.logEntries.Append(args.AppendArgs.Entries)
-		rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
 
-		//rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
-		DPrintf("[AppendEntries] %d append entries from %d, term %d, prevIndex %d, prevTerm %d, entries %v", rf.me, args.LeaderId, args.Term, args.AppendArgs.PrevLogIndex, args.AppendArgs.PrevLogTerm, args.AppendArgs.Entries)
+	// 如果没有日志，则是心跳包，尝试更新commitIndex，若返回false，说明日志未匹配上
+	if args.AppendArgs.Entries == nil {
+		reply.Term = rf.currentTerm.Load()
+		logEntry := rf.logEntries.Find(args.AppendArgs.PrevLogIndex)
+		// term未匹配，说明日志是需要丢弃的
+		if logEntry == nil || logEntry.Term != args.AppendArgs.PrevLogTerm {
+			reply.Success = false
+		} else {
+			reply.Success = true
+			// 更新commitIndex
+			if args.AppendArgs.CommitIndex > rf.commitIndex.Load() {
+				rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
+			}
+		}
+		return
 	}
+	entry := rf.logEntries.Find(args.AppendArgs.PrevLogIndex)
+	// 不存在这个日志，说明缺日志，要更往前的日志
+	if entry == nil {
+		reply.Term = rf.currentTerm.Load()
+		reply.Success = false
+		//reply.ConflictTerm = -1
+		//reply.ConflictIndex = rf.lastLogIndex.Load() + 1 // 让leader知道要回退到哪里
+		return
+	}
+	// 如果存在这个日志，但是任期不匹配，说明日志不一致
+	if entry.Term != args.AppendArgs.PrevLogTerm {
+		// 删除这条日志及所有后继日志,和leader拿更往前的日志来校验
+		rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex)
+		rf.lastLogIndex.Store(args.AppendArgs.PrevLogIndex - 1)
+		//conflictTerm := entry.Term
+		// 告诉leader拿当前冲突term之前一个term的日志索引
+		//first := args.AppendArgs.PrevLogIndex
+		//for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
+		//	first--
+		//}
+		reply.Term = rf.currentTerm.Load()
+		reply.Success = false
+		//reply.ConflictTerm = conflictTerm
+		//reply.ConflictIndex = first // 让leader知道下次的nextIndex
+		return
+	}
+	// 如果存在这个日志，且任期匹配，说明日志一致,追加日志
+	rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex + 1)
+	rf.logEntries.Append(args.AppendArgs.Entries)
+	rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
 
-	// 无论心跳还是发日志，都检查更新commitIndex
-	if args.CommitIndex > rf.commitIndex.Load() {
-		rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.CommitIndex))
-	}
+	rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
+	DPrintf("[AppendEntries] %d append entries from %d, term %d, prevIndex %d, prevTerm %d, entries %v", rf.me, args.LeaderId, args.Term, args.AppendArgs.PrevLogIndex, args.AppendArgs.PrevLogTerm, args.AppendArgs.Entries)
 
 	reply.Term = rf.currentTerm.Load()
 	reply.Success = true
@@ -399,8 +409,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = int(rf.lastLogIndex.Load())
 	term = int(rf.currentTerm.Load())
 	// 更新leader的nextIndex和matchIndex，虽然好像不太重要
-	//rf.matchIndex[rf.me] = index
-	//rf.nextIndex[rf.me] = index + 1
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
 	rf.mu.Unlock()
 
 	return index, term, isLeader
@@ -458,12 +468,18 @@ func (rf *Raft) startElection() {
 
 	var votes atomic.Int32
 	votes.Add(1) // candidate自己投票给自己
-	//DPrintf("[RequestVote] %d vote for itself, term %d", rf.me, currentTerm)
+	DPrintf("[RequestVote] %d vote for itself, term %d", rf.me, currentTerm)
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		args := &RequestVoteArgs{Term: currentTerm, CandidateId: rf.me}
+		args := &RequestVoteArgs{
+			Term:        currentTerm,
+			CandidateId: rf.me,
+			// 3B
+			LastLogIndex: rf.lastLogIndex.Load(),       // Candidate最后一条日志记录的索引
+			LastLogTerm:  rf.logEntries.GetLast().Term, // Candidate最后一条日志记录的任期
+		}
 
 		go func(peer int) {
 			var reply RequestVoteReply
@@ -504,31 +520,28 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 			continue
 		}
 		args := &AppendEntriesArgs{
-			Term:        currentTerm,
-			LeaderId:    rf.me,
-			CommitIndex: commitIndex, // 发送心跳时，包含当前的commitIndex
+			Term:     currentTerm,
+			LeaderId: rf.me,
 		}
 		// todo: 这里可能会有问题，我是在确保新增日志只会在下个心跳周期内追加
+		// 加锁，保护对日志的访问
+		rf.mu.Lock()
 		nextIndex := rf.nextIndex[i]
+		prevIndex := int64(nextIndex - 1)
+		prevTerm := rf.logEntries.Find(prevIndex).Term
+		entries := LogEntries(nil)
 		if int64(nextIndex) <= lastLogIndex {
-			//_, midLog := rf.logEntries.Split(rf.nextIndex[i] - 1)
-			//sendLog, _ := midLog.Split(length - rf.nextIndex[i])
-			// 加锁，保护对日志的访问
-			rf.mu.Lock()
-			prevIndex := int64(nextIndex - 1)
-			prevTerm := rf.logEntries.Find(prevIndex).Term
-			entries := make(LogEntries, len(rf.logEntries[nextIndex:]))
+			entries = make(LogEntries, len(rf.logEntries[nextIndex:]))
 			copy(entries, rf.logEntries[nextIndex:])
-			args.AppendArgs = &AppendEntriesAppendArgs{
-				PrevLogIndex: prevIndex,
-				PrevLogTerm:  prevTerm,
-				Entries:      entries,
-				CommitIndex:  commitIndex,
-			}
 			//DPrintf("[SendAppendEntries] %d send to %d, term %d, nextIndex %d, prevIndex %d, prevTerm %d, entries %v", rf.me, i, currentTerm, nextIndex, prevIndex, prevTerm, entries)
-			rf.mu.Unlock()
-
 		}
+		args.AppendArgs = &AppendEntriesAppendArgs{
+			PrevLogIndex: prevIndex,
+			PrevLogTerm:  prevTerm,
+			Entries:      entries,
+			CommitIndex:  commitIndex,
+		}
+		rf.mu.Unlock()
 
 		go func(peer int) {
 			var reply AppendEntriesReply
@@ -541,15 +554,12 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 				if !rf.workerStatus.Equal(LeaderStatus) || rf.currentTerm.Load() != currentTerm {
 					return // 已经变成 follower 或 term 变了
 				}
-				// 没有appendArgs，说明只是单纯的心跳
-				if args.AppendArgs == nil {
-					return
-				}
-				if reply.Success {
+				// 心跳包的replySuccess不处理
+				if reply.Success && args.AppendArgs.Entries != nil {
 					rf.nextIndex[peer] = nextIndex + len(args.AppendArgs.Entries)
 					rf.matchIndex[peer] = rf.nextIndex[peer] - 1
 					rf.leaderCheckCommitIndex()
-				} else {
+				} else if !reply.Success {
 					rf.nextIndex[peer] = maxInt(rf.nextIndex[peer]-1, 1)
 					//if reply.ConflictTerm == -1 { // follower 日志太短
 					//	rf.nextIndex[peer] = int(reply.ConflictIndex)
@@ -575,18 +585,20 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 
 // leaderCheckCommitIndex [上层有锁]检查leader的commitIndex
 func (rf *Raft) leaderCheckCommitIndex() {
-	for N := rf.commitIndex.Load() + 1; N <= rf.lastLogIndex.Load(); N++ {
-		cnt := 1
-		for p := range rf.peers {
-			DPrintf("[CheckCommitIndex] peer %d checking commit index, N %d, matchIndex %d,nextIndex %d", p, N, rf.matchIndex[p], rf.nextIndex[p])
-			if p != rf.me && int64(rf.matchIndex[p]) >= N {
-				cnt++
+	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
+		rf.logEntries.Find(N).Term == rf.currentTerm.Load(); N-- {
+		count := 1
+		for s, matchIndex := range rf.matchIndex {
+			if s == rf.me {
+				continue
 			}
-		}
-		if cnt > len(rf.peers)/2 {
-			rf.commitIndex.Store(N)
-		} else {
-			break // 及时释放锁
+			if int64(matchIndex) >= N {
+				count++
+			}
+			if count > len(rf.peers)/2 {
+				rf.commitIndex.Store(N)
+				break
+			}
 		}
 	}
 	DPrintf("[LeaderCheckCommitIndex] %d check commit index %d, lastLogIndex %d", rf.me, rf.commitIndex.Load(), rf.lastLogIndex.Load())
