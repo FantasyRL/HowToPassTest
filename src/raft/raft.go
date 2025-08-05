@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"log"
 	//	"bytes"
 	"math/rand"
@@ -157,6 +159,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm.Load())
+	e.Encode(rf.votedFor.Load())
+	e.Encode(rf.logEntries)
+	e.Encode(rf.lastLogIndex.Load())
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -177,6 +187,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logEntries LogEntries
+	var currentTerm int64
+	var votedFor int64
+	var lastLogIndex int64
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logEntries) != nil ||
+		d.Decode(&lastLogIndex) != nil {
+		DPrintf("[ERROR][readPersist] decode error")
+	} else {
+		rf.currentTerm.Store(currentTerm)
+		rf.votedFor.Store(votedFor)
+		rf.logEntries = logEntries
+		rf.lastLogIndex.Store(lastLogIndex)
+		DPrintf("[readPersist] currentTerm %d, votedFor %d, lastLogIndex %d, logEntries %v", rf.currentTerm.Load(), rf.votedFor.Load(), rf.lastLogIndex.Load(), rf.logEntries)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -231,6 +259,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if isUpToDate {
 			rf.resetElectionTimer()
 			rf.votedFor.Store(int64(args.CandidateId))
+			// votedFor变化，persist
+			rf.persist()
 			reply.VoteGranted = true
 			DPrintf("[RequestVote] %d vote for %d, term %d", rf.me, args.CandidateId, args.Term)
 		} else {
@@ -291,10 +321,10 @@ type AppendEntriesAppendArgs struct {
 	CommitIndex  int64 // leader's commitIndex, 用于follower更新自己的commitIndex
 }
 type AppendEntriesReply struct {
-	Term    int64 // currentTerm, for leader to update itself
-	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
-	//ConflictTerm  int64 // follower 日志的冲突 term，-1 表示缺少条目
-	//ConflictIndex int64 // follower 希望 leader 退回到的 nextIndex
+	Term          int64 // currentTerm, for leader to update itself
+	Success       bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictTerm  int64 // follower 日志的冲突 term，-1 表示缺少条目
+	ConflictIndex int64 // follower 希望 leader 退回到的 nextIndex
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -334,8 +364,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if entry == nil {
 		reply.Term = rf.currentTerm.Load()
 		reply.Success = false
-		//reply.ConflictTerm = -1
-		//reply.ConflictIndex = rf.lastLogIndex.Load() + 1 // 让leader知道要回退到哪里
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = rf.lastLogIndex.Load() + 1 // 让leader知道要回退到哪里
 		return
 	}
 	// 如果存在这个日志，但是任期不匹配，说明日志不一致
@@ -343,22 +373,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 删除这条日志及所有后继日志,和leader拿更往前的日志来校验
 		rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex)
 		rf.lastLogIndex.Store(args.AppendArgs.PrevLogIndex - 1)
-		//conflictTerm := entry.Term
+		// 日志变化，persist
+		rf.persist()
+		conflictTerm := entry.Term
 		// 告诉leader拿当前冲突term之前一个term的日志索引
-		//first := args.AppendArgs.PrevLogIndex
-		//for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
-		//	first--
-		//}
+		first := args.AppendArgs.PrevLogIndex
+		for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
+			first--
+		}
 		reply.Term = rf.currentTerm.Load()
 		reply.Success = false
-		//reply.ConflictTerm = conflictTerm
-		//reply.ConflictIndex = first // 让leader知道下次的nextIndex
+		reply.ConflictTerm = conflictTerm
+		reply.ConflictIndex = first // 让leader知道下次的nextIndex
 		return
 	}
 	// 如果存在这个日志，且任期匹配，说明日志一致,追加日志
 	rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex + 1)
 	rf.logEntries.Append(args.AppendArgs.Entries)
 	rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
+	// 日志变化，persist
+	rf.persist()
 
 	rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
 	DPrintf("[AppendEntries] %d append entries from %d, term %d, prevIndex %d, prevTerm %d, entries %v", rf.me, args.LeaderId, args.Term, args.AppendArgs.PrevLogIndex, args.AppendArgs.PrevLogTerm, args.AppendArgs.Entries)
@@ -406,6 +440,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.logEntries = append(rf.logEntries, newEntry)
 	rf.lastLogIndex.Add(1) // 更新最后一条日志的索引
+	// 日志变化，persist
+	rf.persist()
 	index = int(rf.lastLogIndex.Load())
 	term = int(rf.currentTerm.Load())
 	// 更新leader的nextIndex和matchIndex，虽然好像不太重要
@@ -560,21 +596,21 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 					rf.matchIndex[peer] = rf.nextIndex[peer] - 1
 					rf.leaderCheckCommitIndex()
 				} else if !reply.Success {
-					rf.nextIndex[peer] = maxInt(rf.nextIndex[peer]-1, 1)
-					//if reply.ConflictTerm == -1 { // follower 日志太短
-					//	rf.nextIndex[peer] = int(reply.ConflictIndex)
-					//} else {
-					//	// 在自己日志中寻找 ConflictTerm 最后一条
-					//	idx := rf.lastLogIndex.Load()
-					//	for idx > 0 && rf.logEntries.Find(idx).Term != reply.ConflictTerm {
-					//		idx--
-					//	}
-					//	if idx > 0 { // 找到了同 term
-					//		rf.nextIndex[peer] = int(idx + 1)
-					//	} else { // 找不到，同论文第二条策略
-					//		rf.nextIndex[peer] = int(reply.ConflictIndex)
-					//	}
-					//}
+					//rf.nextIndex[peer] = maxInt(rf.nextIndex[peer]-1, 1)
+					if reply.ConflictTerm == -1 {
+						rf.nextIndex[peer] = int(reply.ConflictIndex)
+					} else {
+						index := rf.nextIndex[peer]
+						// 找到冲突term的最后一个日志索引
+						for index > 0 && rf.logEntries.Find(int64(index-1)).Term == reply.ConflictTerm {
+							index--
+						}
+						if index > 0 {
+							rf.nextIndex[peer] = int(index)
+						} else {
+							rf.nextIndex[peer] = int(reply.ConflictIndex)
+						}
+					}
 				}
 			}
 		}(i)
@@ -585,8 +621,13 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 
 // leaderCheckCommitIndex [上层有锁]检查leader的commitIndex
 func (rf *Raft) leaderCheckCommitIndex() {
-	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
-		rf.logEntries.Find(N).Term == rf.currentTerm.Load(); N-- {
+	// 3C
+	//for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
+	//	rf.logEntries.Find(N).Term == rf.currentTerm.Load(); N-- {
+	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load(); N-- {
+		if rf.logEntries.Find(N).Term != rf.currentTerm.Load() {
+			continue // 跳过，而非退出，之前的日志可能一致
+		}
 		count := 1
 		for s, matchIndex := range rf.matchIndex {
 			if s == rf.me {
@@ -595,18 +636,20 @@ func (rf *Raft) leaderCheckCommitIndex() {
 			if int64(matchIndex) >= N {
 				count++
 			}
-			if count > len(rf.peers)/2 {
-				rf.commitIndex.Store(N)
-				break
-			}
+		}
+
+		if count > len(rf.peers)/2 {
+			rf.commitIndex.Store(N)
+			break
 		}
 	}
-	DPrintf("[LeaderCheckCommitIndex] %d check commit index %d, lastLogIndex %d", rf.me, rf.commitIndex.Load(), rf.lastLogIndex.Load())
+
+	DPrintf("[LeaderCheckCommitIndex] %d check commitindex %d, lastLogIndex %d", rf.me, rf.commitIndex.Load(), rf.lastLogIndex.Load())
 }
 
 func (rf *Raft) committer() {
 	commitTimeout := func() time.Duration {
-		return time.Duration(50+rand.Intn(50)) * time.Millisecond
+		return time.Duration(10+rand.Intn(50)) * time.Millisecond
 	}
 
 	for !rf.killed() {

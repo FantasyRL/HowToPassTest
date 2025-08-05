@@ -34,6 +34,8 @@ func (rf *Raft) becomeFollower(term int64) {
 	rf.currentTerm.Store(term)
 	rf.votedFor.Store(-1)
 	rf.resetElectionTimer()
+	// 任期变化，persist
+	rf.persist()
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -41,6 +43,8 @@ func (rf *Raft) becomeCandidate() {
 	rf.currentTerm.Add(1)
 	rf.votedFor.Store(int64(rf.me)) // 先票给自己
 	rf.resetElectionTimer()
+	// 任期与votedFor变化，persist
+	rf.persist()
 }
 
 func (rf *Raft) becomeLeader() {
