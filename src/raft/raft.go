@@ -395,7 +395,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		return
 	}
-
+	DPrintf("[AppendEntries] %d append entries from %d, prevIndex %d, prevTerm %d, entries %v", rf.me, args.LeaderId, prevIndex, prevTerm, entries)
+	DPrintf("[AppendEntries] %d have entry %v", rf.me, entries)
 	// 追加：按 RFC 的做法，只在发现冲突处截断，然后附加后缀
 	// 从 prevIndex+1 开始，对齐 entries
 	appendFrom := int64(len(entries)) // 默认都匹配（即只需要可能扩展）
@@ -515,6 +516,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	index = int(rf.lastLogIndex.Load())
 	term = int(rf.currentTerm.Load())
+	DPrintf("[Start] %d append command %v, logIndex %d, term %d", rf.me, command, index, term)
 	// 更新leader的nextIndex和matchIndex，虽然好像不太重要
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
@@ -683,6 +685,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 					if rf.nextIndex[peer] < newNext {
 						rf.nextIndex[peer] = newNext
 						rf.matchIndex[peer] = maxInt(rf.matchIndex[peer], newNext-1)
+						DPrintf("[sendHeartbeatsAndLogEntries] %d matchIndex update to %d", peer, rf.matchIndex[peer])
 						rf.leaderCheckCommitIndex()
 						// 取得进展，立刻再发一轮，加快追赶
 						//go rf.sendHeartbeatsAndLogEntries()
@@ -724,34 +727,35 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 
 // leaderCheckCommitIndex [上层有锁]检查leader的commitIndex
 func (rf *Raft) leaderCheckCommitIndex() {
-	// 3C
+	curTerm := rf.currentTerm.Load()
 	old := rf.commitIndex.Load()
+	last := rf.lastLogIndex.Load()
+
 	newCommit := old
-	//for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
-	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load(); N-- {
-		if rf.Find3D(N).Term != rf.currentTerm.Load() {
-			continue // 跳过，而非退出，之前的日志可能一致
+	for N := old + 1; N <= last; N++ {
+		t, ok := rf.termAt3D(N)
+		if !ok || t != curTerm { // 只提交本任期
+			continue
 		}
-		count := 1
-		for s, matchIndex := range rf.matchIndex {
+		cnt := 1 // self
+		for s, m := range rf.matchIndex {
 			if s == rf.me {
 				continue
 			}
-			if int64(matchIndex) >= N {
-				count++
+			if int64(m) >= N {
+				cnt++
 			}
 		}
-
-		if count > len(rf.peers)/2 {
+		if cnt > len(rf.peers)/2 {
 			newCommit = N
 		}
 	}
 	if newCommit > old {
 		rf.commitIndex.Store(newCommit)
-		//  figure8(unreliable)：手动触发提交event
 		rf.notifyCommit()
+		DPrintf("[LeaderCheckCommitIndex] %d commitIndex %d -> %d, lastLogIndex %d",
+			rf.me, old, newCommit, last)
 	}
-	DPrintf("[LeaderCheckCommitIndex] %d commitIndex %d -> %d, lastLogIndex %d", rf.me, old, rf.commitIndex.Load(), rf.lastLogIndex.Load())
 }
 
 // committer figure8(unreliable)：事件驱动 + 定时兜底；一轮内清空新commit
@@ -827,7 +831,6 @@ func (rf *Raft) committer() {
 				}
 				rf.lastApplied.Add(1)
 			}
-
 		}
 	}
 }
