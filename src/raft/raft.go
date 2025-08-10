@@ -174,10 +174,28 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm.Load())
 	e.Encode(rf.votedFor.Load())
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.logEntries)
 	e.Encode(rf.lastLogIndex.Load())
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.SaveRaftState(raftstate)
+}
+func (rf *Raft) persistStateAndSnapshot(snapshot []byte) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// 3A/3B/3C
+	e.Encode(rf.currentTerm.Load())
+	e.Encode(rf.votedFor.Load())
+	// 3D 元信息
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	// 日志（注意第0位为哨兵）
+	e.Encode(rf.logEntries)
+	e.Encode(rf.lastLogIndex.Load())
+
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, snapshot)
 }
 
 // restore previously persisted state.
@@ -204,8 +222,12 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int64
 	var votedFor int64
 	var lastLogIndex int64
+	var lastIncludedIndex int64
+	var lastIncludedTerm int64
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logEntries) != nil ||
 		d.Decode(&lastLogIndex) != nil {
 		DPrintf("[ERROR][readPersist] decode error")
@@ -214,7 +236,21 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor.Store(votedFor)
 		rf.logEntries = logEntries
 		rf.lastLogIndex.Store(lastLogIndex)
-		DPrintf("[readPersist] currentTerm %d, votedFor %d, lastLogIndex %d, logEntries %v", rf.currentTerm.Load(), rf.votedFor.Load(), rf.lastLogIndex.Load(), rf.logEntries)
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		DPrintf3D("[readPersist] %d: term %d, votedFor %d, lastIncludedIndex %d, lastIncludedTerm %d, lastLogIndex %d, log[0]=%v, len=%d",
+			rf.me, rf.currentTerm.Load(), rf.votedFor.Load(),
+			rf.lastIncludedIndex, rf.lastIncludedTerm,
+			rf.lastLogIndex.Load(),
+			func() interface{} {
+				if len(rf.logEntries) > 0 {
+					return rf.logEntries[0]
+				}
+				return nil
+			}(),
+			len(rf.logEntries),
+		)
+
 	}
 }
 
@@ -223,10 +259,43 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	abs := int64(index)
+	// 边界处理
+	if abs <= rf.lastIncludedIndex || abs > rf.lastLogIndex.Load() {
+		return
+	}
+
+	// 取该 index 的 term（3D 偏移安全）
+	t, ok := rf.termAt3D(abs)
+	if !ok {
+		return
+	}
+
+	// 新日志：哨兵 + 旧日志的后缀 (index+1 .. last]
+	var newLog LogEntries
+	newLog = append(newLog, Entry{Term: t, Command: nil})
+	if i, ok := rf.toSliceIndex(abs); ok && int(i+1) <= len(rf.logEntries)-1 {
+		newLog = append(newLog, rf.logEntries[i+1:]...)
+	}
+	rf.logEntries = newLog
+
+	// 更新args
+	rf.lastIncludedIndex = abs
+	rf.lastIncludedTerm = t
+	if rf.lastLogIndex.Load() < rf.lastIncludedIndex {
+		rf.lastLogIndex.Store(rf.lastIncludedIndex)
+	}
+	// 避免committer取得锁后把快照之前的日志条目应用
+	if rf.commitIndex.Load() < rf.lastIncludedIndex {
+		rf.commitIndex.Store(rf.lastIncludedIndex)
+	}
+
+	// 持久化：状态 + 快照字节
+	rf.persistStateAndSnapshot(snapshot)
+	rf.notifyCommit()
 }
 
 // example RequestVote RPC arguments structure.
@@ -467,7 +536,38 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term > rf.currentTerm.Load() || rf.workerStatus.value.Load() != FollowerStatus {
 		rf.becomeFollower(args.Term)
 	}
-	// 在快照文件的指定偏移量写入数据
+	// 如果收到的快照不比本地新，忽略,但算成功，确保幂等性
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		reply.Success = true
+		return
+	}
+	// 在快照文件的指定偏移量写入数据（我不用偏移）
+	var newLog LogEntries
+	// 初始化log
+	newLog = append(newLog, Entry{Term: args.LastIncludedTerm, Command: nil})
+	// 若我们本地在该 index 之后还有日志，并且 index 处 term 匹配，则把后缀接上
+	if i, ok := rf.toSliceIndex(args.LastIncludedIndex); ok {
+		// index 处的 term 一定匹配（因为appendEntries时校验过）
+		// i+1 : 跳过哨兵日志的复制
+		if i+1 <= rf.Len3D() {
+			newLog = append(newLog, rf.logEntries[i+1:]...)
+		}
+	}
+	rf.logEntries = newLog
+	// 更新args
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	if rf.lastLogIndex.Load() < rf.lastIncludedIndex {
+		rf.lastLogIndex.Store(rf.lastIncludedIndex)
+	}
+	if rf.commitIndex.Load() < rf.lastIncludedIndex {
+		rf.commitIndex.Store(rf.lastIncludedIndex)
+	}
+	rf.persistStateAndSnapshot(args.Data)
+
+	reply.Success = true
+
+	rf.notifyCommit()
 
 }
 
@@ -644,6 +744,46 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 		}
 		term := rf.currentTerm.Load()
 		next := rf.nextIndex[i]
+		// lab3D: InstallSnapshot
+		if int64(next) <= rf.lastIncludedIndex {
+			lastIncludedIndex := rf.lastIncludedIndex
+			lastIncludedTerm := rf.lastIncludedTerm
+			args := &InstallSnapshotArgs{
+				Term:              term,
+				LeaderId:          rf.me,
+				LastIncludedIndex: lastIncludedIndex,
+				LastIncludedTerm:  lastIncludedTerm,
+				Offset:            0,
+				Data:              rf.persister.ReadSnapshot(),
+				Done:              true,
+			}
+			rf.mu.Unlock()
+			go func(peer int, a *InstallSnapshotArgs) {
+				var rep InstallSnapshotReply
+				if rf.sendInstallSnapshot(peer, a, &rep) {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rep.Term > rf.currentTerm.Load() {
+						rf.becomeFollower(rep.Term)
+						return
+					}
+					if !rf.workerStatus.Equal(LeaderStatus) || rf.currentTerm.Load() != a.Term {
+						return
+					}
+
+					// 安装成功：把该 follower 的进度推进到快照之后
+					if rf.nextIndex[peer] < int(lastIncludedIndex+1) {
+						rf.nextIndex[peer] = int(lastIncludedIndex + 1)
+					}
+					if rf.matchIndex[peer] < int(lastIncludedIndex) {
+						rf.matchIndex[peer] = int(lastIncludedIndex)
+					}
+					// 安装后可再试一轮 AE
+					go rf.sendHeartbeatsAndLogEntries()
+				}
+			}(i, args)
+			continue
+		}
 		prevIndex := int64(next - 1)
 		prevTerm := rf.Find3D(prevIndex).Term
 		lastIndex := rf.lastLogIndex.Load()
