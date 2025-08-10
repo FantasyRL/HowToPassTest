@@ -408,7 +408,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if ex.Term != entries[k].Term {
 			// 截断到冲突点（不包含 idx）
-			rf.logEntries, _ = rf.logEntries.Split(idx)
+			rf.ReservePrefix3D(idx - 1)
 			rf.lastLogIndex.Store(idx - 1)
 			appendFrom = k
 			break
@@ -416,7 +416,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if appendFrom < int64(len(entries)) {
 		rf.logEntries.Append(entries[appendFrom:])
-		rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
+		rf.SetLastLogIndex3D()
 		rf.persist()
 	}
 
@@ -649,8 +649,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 
 		var entries LogEntries
 		if int64(next) <= lastIndex {
-			entries = make(LogEntries, len(rf.logEntries[next:]))
-			copy(entries, rf.logEntries[next:])
+			entries = rf.SplitEntriesFrom3D(int64(next))
 		} else {
 			entries = nil
 		}
@@ -773,23 +772,61 @@ func (rf *Raft) committer() {
 			rf.mu.Lock()
 			lastApplied := rf.lastApplied.Load()
 			commitIndex := rf.commitIndex.Load()
-			if lastApplied >= commitIndex {
+
+			// 有快照还没交付给状态机，先下发快照
+			if lastApplied < rf.lastIncludedIndex {
+				snap := rf.persister.ReadSnapshot() // 3D 时持久化的快照
+				snapIdx := rf.lastIncludedIndex
+				snapTerm := rf.lastIncludedTerm
+				rf.mu.Unlock()
+
+				rf.applyCh <- ApplyMsg{
+					CommandValid:  false,
+					SnapshotValid: true,
+					Snapshot:      snap,
+					SnapshotIndex: int(snapIdx),
+					SnapshotTerm:  int(snapTerm),
+				}
+				// 快照已应用，推进 lastApplied；下一轮再继续 apply 日志
+				rf.lastApplied.Store(snapIdx)
+				continue
+			}
+
+			// 没有可 apply 的新日志
+			if commitIndex <= lastApplied {
 				rf.mu.Unlock()
 				break
 			}
-			// 复制需要 apply 的条目到独立切片
-			todo := make(LogEntries, commitIndex-lastApplied)
-			copy(todo, rf.logEntries[lastApplied+1:commitIndex+1])
-			rf.mu.Unlock()
 
-			DPrintf("[Committer] %d commit entries from %d to %d", rf.me, lastApplied+1, commitIndex)
+			// 计算要 apply 的绝对区间 [startAbs, endAbs]
+			startAbs := lastApplied + 1
+			endAbs := commitIndex
+
+			// 映射到切片下标
+			sIdx, okS := rf.toSliceIndex(startAbs) // 期望 ≥ 1（0 是哨兵）
+			eIdx, okE := rf.toSliceIndex(endAbs)
+			if !okS || !okE || sIdx > eIdx {
+				// 理论上不该发生
+				rf.mu.Unlock()
+				break
+			}
+
+			// 拷贝要 apply 的日志到独立切片
+			todo := make(LogEntries, eIdx-sIdx+1)
+			copy(todo, rf.logEntries[sIdx:eIdx+1])
+			rf.mu.Unlock()
 
 			// 应用日志条目到状态机（无锁）
 			for i, entry := range todo {
-				msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: int(lastApplied) + i + 1}
-				rf.applyCh <- msg
+				absIndex := int(startAbs) + i
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: absIndex,
+				}
 				rf.lastApplied.Add(1)
 			}
+
 		}
 	}
 }

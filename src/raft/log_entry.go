@@ -69,6 +69,18 @@ func (rf *Raft) toSliceIndex(index int64) (int, bool) {
 	return int(off), true
 }
 
+func (rf *Raft) Len3D() int {
+	// 返回当前日志条目数量（不包括哨兵）
+	if len(rf.logEntries) <= 1 {
+		return 0 // 只剩下哨兵日志
+	}
+	return len(rf.logEntries) - 1 // 哨兵不计入长度
+}
+
+func (rf *Raft) SetLastLogIndex3D() {
+	rf.lastLogIndex.Store(int64(rf.Len3D()) + rf.lastIncludedIndex)
+}
+
 // termAt3D 读取 index 处的任期（考虑快照偏移）
 func (rf *Raft) termAt3D(index int64) (term int64, ok bool) {
 	if index == rf.lastIncludedIndex {
