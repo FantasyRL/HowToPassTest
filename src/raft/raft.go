@@ -77,8 +77,12 @@ type Raft struct {
 	// 3C advanced Raft
 	// 提交通知（事件驱动的异步 apply）
 	commitNotify chan struct{}
-	// appendEntries单飞 防止leader在发送AppendEntries过快
+	// [forbid] appendEntries单飞 防止leader在发送AppendEntries过快
 	//appendEntriesRequesting []int32
+
+	// 3D snapshot
+	lastIncludedIndex int64 // 快照包含的最后一条日志的索引
+	lastIncludedTerm  int64 // 快照包含的最后一条日志的任期
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -126,6 +130,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// appendEntries单飞，防止leader在发送AppendEntries过快
 	//rf.appendEntriesRequesting = make([]int32, len(rf.peers))
 	// initialize from state persisted before a crash
+	rf.lastIncludedIndex = 0 // 初始快照索引为0
+	rf.lastIncludedTerm = 0  // 初始快照任期为0
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
@@ -218,6 +224,8 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 }
 
@@ -353,7 +361,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	prevIndex := args.AppendArgs.PrevLogIndex
 	prevTerm := args.AppendArgs.PrevLogTerm
-	prevEntry := rf.logEntries.Find(prevIndex)
+	prevEntry := rf.Find3D(prevIndex)
 
 	// 统一提供快速回退所需的冲突信息（包括心跳路径）
 	if prevEntry == nil {
@@ -366,7 +374,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// term 冲突：找到 follower 本地该 term 的第一位置
 		conflictTerm := prevEntry.Term
 		first := prevIndex
-		for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
+		for first > 0 && rf.Find3D(first-1).Term == conflictTerm {
 			first--
 		}
 		reply.Success = false
@@ -393,7 +401,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	appendFrom := int64(len(entries)) // 默认都匹配（即只需要可能扩展）
 	for k := int64(0); k < int64(len(entries)); k++ {
 		idx := prevIndex + 1 + k
-		ex := rf.logEntries.Find(idx)
+		ex := rf.Find3D(idx)
 		if ex == nil {
 			appendFrom = k
 			break
@@ -426,6 +434,47 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type InstallSnapshotArgs struct {
+	Term              int64  // leader's term
+	LeaderId          int    // so follower can redirect clients
+	LastIncludedIndex int64  // 快照包含的最后一条日志的索引
+	LastIncludedTerm  int64  // 快照包含的最后一条日志的任期
+	Offset            int64  // 快照数据的偏移量
+	Data              []byte // 快照数据
+	Done              bool   // 是否是最后一块数据
+}
+type InstallSnapshotReply struct {
+	Term    int64 // currentTerm, for leader to update itself
+	Success bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 如果 leader 的任期小于自己的任期返回 false
+	if args.Term < rf.currentTerm.Load() {
+		reply.Term = rf.currentTerm.Load()
+		reply.Success = false
+		return
+	}
+	// 收到更大任期或来自 leader 的心跳/追加
+	rf.resetElectionTimer()
+	// 只要收到了新leader的心跳，就将自己变为follower
+	if args.Term > rf.currentTerm.Load() || rf.workerStatus.value.Load() != FollowerStatus {
+		rf.becomeFollower(args.Term)
+	}
+	// 在快照文件的指定偏移量写入数据
+
+}
+
+// sendInstallSnapshot sends InstallSnapshot RPC to a server.
+// 当Follower刚刚恢复，如果它的Log短于Leader通过 AppendEntries RPC发给它的内容，
+// 那么它首先会强制Leader回退自己的Log。在某个点，Leader将不能再回退,这时，Leader会将自己的快照发给Follower
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -594,7 +643,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 		term := rf.currentTerm.Load()
 		next := rf.nextIndex[i]
 		prevIndex := int64(next - 1)
-		prevTerm := rf.logEntries.Find(prevIndex).Term
+		prevTerm := rf.Find3D(prevIndex).Term
 		lastIndex := rf.lastLogIndex.Load()
 		commitIdx := rf.commitIndex.Load()
 
@@ -649,7 +698,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 						last := int(rf.lastLogIndex.Load())
 						j := 0
 						for idx := last; idx > 0; idx-- {
-							if rf.logEntries.Find(int64(idx)).Term == reply.ConflictTerm {
+							if rf.Find3D(int64(idx)).Term == reply.ConflictTerm {
 								j = idx
 								break
 							}
@@ -681,7 +730,7 @@ func (rf *Raft) leaderCheckCommitIndex() {
 	newCommit := old
 	//for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
 	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load(); N-- {
-		if rf.logEntries.Find(N).Term != rf.currentTerm.Load() {
+		if rf.Find3D(N).Term != rf.currentTerm.Load() {
 			continue // 跳过，而非退出，之前的日志可能一致
 		}
 		count := 1
