@@ -54,6 +54,8 @@ func (rf *Raft) becomeLeader() {
 			rf.nextIndex[i] = int(rf.lastLogIndex.Load() + 1)
 			rf.matchIndex[i] = 0 // 表示还没有匹配的日志
 		}
+		// 一个比较无所谓的东西...
+		rf.matchIndex[rf.me] = int(rf.lastLogIndex.Load())
 		DPrintf("[LEADER_ELECTIONED] %d become leader, term %d", rf.me, rf.currentTerm.Load())
 		rf.workerStatus.Set(LeaderStatus)
 		go func() {
@@ -62,7 +64,7 @@ func (rf *Raft) becomeLeader() {
 					return
 				}
 				rf.sendHeartbeatsAndLogEntries()
-				time.Sleep(50 * time.Millisecond) // 50ms < electionTimeoutMin(300ms)
+				time.Sleep(30 * time.Millisecond) // 50ms < electionTimeoutMin(300ms)
 			}
 		}()
 

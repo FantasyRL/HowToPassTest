@@ -19,16 +19,13 @@ package raft
 
 import (
 	"6.5840/labgob"
+	"6.5840/labrpc"
 	"bytes"
 	"log"
-	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"6.5840/labgob"
-	"6.5840/labrpc"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -76,6 +73,12 @@ type Raft struct {
 	nextIndex  []int // 对于每个follower，leader期望的下一个日志索引
 	matchIndex []int // 对于每个follower，leader已知的已提交日志索引
 	applyCh    chan ApplyMsg
+
+	// 3C advanced Raft
+	// 提交通知（事件驱动的异步 apply）
+	commitNotify chan struct{}
+	// appendEntries单飞 防止leader在发送AppendEntries过快
+	//appendEntriesRequesting []int32
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -118,6 +121,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex = append(rf.matchIndex, 0) // 初始时，leader已知的已提交日志索引为0
 	}
 
+	// 事件驱动提交信号
+	rf.commitNotify = make(chan struct{}, 1)
+	// appendEntries单飞，防止leader在发送AppendEntries过快
+	//rf.appendEntriesRequesting = make([]int32, len(rf.peers))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -137,9 +144,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (3A).
 	term = int(rf.currentTerm.Load())
 	isleader = rf.workerStatus.value.Load() == LeaderStatus
-	//if isleader {
-	//	DPrintf("[GetState] current term is %d\n", term)
-	//}
+
 	return term, isleader
 }
 
@@ -171,7 +176,7 @@ func (rf *Raft) persist() {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
 	// Your code here (3C).
@@ -231,7 +236,7 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        int64 // currentTerm, for candidate to update itself
+	Term        int64 // currentTerm, for a candidate to update itself
 	VoteGranted bool  // true 表示server向client投票
 }
 
@@ -336,6 +341,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	// 收到更大任期或来自 leader 的心跳/追加
 	rf.resetElectionTimer()
 	// 只要收到了新leader的心跳，就将自己变为follower
 	if args.Term > rf.currentTerm.Load() || rf.workerStatus.value.Load() != FollowerStatus {
@@ -343,59 +349,75 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 如果自己不存在索引、任期和 prevLogIndex、prevLogItem 匹配的日志返回 false
 
-	// 如果没有日志，则是心跳包，尝试更新commitIndex，若返回false，说明日志未匹配上
-	if args.AppendArgs.Entries == nil {
-		reply.Term = rf.currentTerm.Load()
-		logEntry := rf.logEntries.Find(args.AppendArgs.PrevLogIndex)
-		// term未匹配，说明日志是需要丢弃的
-		if logEntry == nil || logEntry.Term != args.AppendArgs.PrevLogTerm {
-			reply.Success = false
-		} else {
-			reply.Success = true
-			// 更新commitIndex
-			if args.AppendArgs.CommitIndex > rf.commitIndex.Load() {
-				rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
-			}
-		}
-		return
-	}
-	entry := rf.logEntries.Find(args.AppendArgs.PrevLogIndex)
-	// 不存在这个日志，说明缺日志，要更往前的日志
-	if entry == nil {
-		reply.Term = rf.currentTerm.Load()
+	reply.Term = rf.currentTerm.Load()
+
+	prevIndex := args.AppendArgs.PrevLogIndex
+	prevTerm := args.AppendArgs.PrevLogTerm
+	prevEntry := rf.logEntries.Find(prevIndex)
+
+	// 统一提供快速回退所需的冲突信息（包括心跳路径）
+	if prevEntry == nil {
 		reply.Success = false
 		reply.ConflictTerm = -1
-		reply.ConflictIndex = rf.lastLogIndex.Load() + 1 // 让leader知道要回退到哪里
+		reply.ConflictIndex = rf.lastLogIndex.Load() + 1
 		return
 	}
-	// 如果存在这个日志，但是任期不匹配，说明日志不一致
-	if entry.Term != args.AppendArgs.PrevLogTerm {
-		// 删除这条日志及所有后继日志,和leader拿更往前的日志来校验
-		rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex)
-		rf.lastLogIndex.Store(args.AppendArgs.PrevLogIndex - 1)
-		// 日志变化，persist
-		rf.persist()
-		conflictTerm := entry.Term
-		// 告诉leader拿当前冲突term之前一个term的日志索引
-		first := args.AppendArgs.PrevLogIndex
+	if prevEntry.Term != prevTerm {
+		// term 冲突：找到 follower 本地该 term 的第一位置
+		conflictTerm := prevEntry.Term
+		first := prevIndex
 		for first > 0 && rf.logEntries.Find(first-1).Term == conflictTerm {
 			first--
 		}
-		reply.Term = rf.currentTerm.Load()
 		reply.Success = false
 		reply.ConflictTerm = conflictTerm
-		reply.ConflictIndex = first // 让leader知道下次的nextIndex
+		reply.ConflictIndex = first
 		return
 	}
-	// 如果存在这个日志，且任期匹配，说明日志一致,追加日志
-	rf.logEntries, _ = rf.logEntries.Split(args.AppendArgs.PrevLogIndex + 1)
-	rf.logEntries.Append(args.AppendArgs.Entries)
-	rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
-	// 日志变化，persist
-	rf.persist()
 
-	rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
-	DPrintf("[AppendEntries] %d append entries from %d, term %d, prevIndex %d, prevTerm %d, entries %v", rf.me, args.LeaderId, args.Term, args.AppendArgs.PrevLogIndex, args.AppendArgs.PrevLogTerm, args.AppendArgs.Entries)
+	// 走到这里 prev 一定匹配
+	entries := args.AppendArgs.Entries
+	if entries == nil || len(entries) == 0 {
+		// 心跳：仅推进 commitIndex
+		reply.Success = true
+		if args.AppendArgs.CommitIndex > rf.commitIndex.Load() {
+			rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
+			// commitIndex更新，触发event
+			rf.notifyCommit()
+		}
+		return
+	}
+
+	// 追加：按 RFC 的做法，只在发现冲突处截断，然后附加后缀
+	// 从 prevIndex+1 开始，对齐 entries
+	appendFrom := int64(len(entries)) // 默认都匹配（即只需要可能扩展）
+	for k := int64(0); k < int64(len(entries)); k++ {
+		idx := prevIndex + 1 + k
+		ex := rf.logEntries.Find(idx)
+		if ex == nil {
+			appendFrom = k
+			break
+		}
+		if ex.Term != entries[k].Term {
+			// 截断到冲突点（不包含 idx）
+			rf.logEntries, _ = rf.logEntries.Split(idx)
+			rf.lastLogIndex.Store(idx - 1)
+			appendFrom = k
+			break
+		}
+	}
+	if appendFrom < int64(len(entries)) {
+		rf.logEntries.Append(entries[appendFrom:])
+		rf.lastLogIndex.Store(int64(rf.logEntries.Len() - 1))
+		rf.persist()
+	}
+
+	// 推进 commitIndex
+	if args.AppendArgs.CommitIndex > rf.commitIndex.Load() {
+		rf.commitIndex.Store(minI64(rf.lastLogIndex.Load(), args.AppendArgs.CommitIndex))
+		// figure8(unreliable): 发送event触发提交
+		rf.notifyCommit()
+	}
 
 	reply.Term = rf.currentTerm.Load()
 	reply.Success = true
@@ -448,6 +470,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
 	rf.mu.Unlock()
+
+	// 立刻触发一次发送，加快复制
+	go rf.sendHeartbeatsAndLogEntries()
 
 	return index, term, isLeader
 }
@@ -545,76 +570,106 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendHeartbeatsAndLogEntries() {
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm.Load()
-	lastLogIndex := rf.lastLogIndex.Load()
-	commitIndex := rf.commitIndex.Load()
-	rf.mu.Unlock()
-
+	// [forbid code]
+	//rf.mu.Lock()
+	//currentTerm := rf.currentTerm.Load()
+	//lastLogIndex := rf.lastLogIndex.Load()
+	//commitIndex := rf.commitIndex.Load()
+	//rf.mu.Unlock()
+	// 为避免读取不一致，针对每个 peer 单独快照当前需要发送的 prev/entries/commit
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		args := &AppendEntriesArgs{
-			Term:     currentTerm,
-			LeaderId: rf.me,
-		}
-		// todo: 这里可能会有问题，我是在确保新增日志只会在下个心跳周期内追加
-		// 加锁，保护对日志的访问
+		// 同时只允许一个requesting
+		//if !atomic.CompareAndSwapInt32(&rf.appendEntriesRequesting[i], 0, 1) {
+		//	continue
+		//}
+
 		rf.mu.Lock()
-		nextIndex := rf.nextIndex[i]
-		prevIndex := int64(nextIndex - 1)
-		prevTerm := rf.logEntries.Find(prevIndex).Term
-		entries := LogEntries(nil)
-		if int64(nextIndex) <= lastLogIndex {
-			entries = make(LogEntries, len(rf.logEntries[nextIndex:]))
-			copy(entries, rf.logEntries[nextIndex:])
-			//DPrintf("[SendAppendEntries] %d send to %d, term %d, nextIndex %d, prevIndex %d, prevTerm %d, entries %v", rf.me, i, currentTerm, nextIndex, prevIndex, prevTerm, entries)
+		if !rf.workerStatus.Equal(LeaderStatus) {
+			rf.mu.Unlock()
+			return
 		}
-		args.AppendArgs = &AppendEntriesAppendArgs{
-			PrevLogIndex: prevIndex,
-			PrevLogTerm:  prevTerm,
-			Entries:      entries,
-			CommitIndex:  commitIndex,
+		term := rf.currentTerm.Load()
+		next := rf.nextIndex[i]
+		prevIndex := int64(next - 1)
+		prevTerm := rf.logEntries.Find(prevIndex).Term
+		lastIndex := rf.lastLogIndex.Load()
+		commitIdx := rf.commitIndex.Load()
+
+		var entries LogEntries
+		if int64(next) <= lastIndex {
+			entries = make(LogEntries, len(rf.logEntries[next:]))
+			copy(entries, rf.logEntries[next:])
+		} else {
+			entries = nil
+		}
+		// figure8(unreliable)：取消每次AppendEntries时的leader状态一致性，有新日志就发送出去
+		args := &AppendEntriesArgs{Term: term, LeaderId: rf.me,
+			AppendArgs: &AppendEntriesAppendArgs{PrevLogIndex: prevIndex, PrevLogTerm: prevTerm, Entries: entries, CommitIndex: commitIdx}}
+		sentPrev := prevIndex
+		sentCount := 0
+		if entries != nil {
+			sentCount = len(entries)
 		}
 		rf.mu.Unlock()
 
-		go func(peer int) {
+		go func(peer int, a *AppendEntriesArgs, sentPrev int64, sentCount int) {
+			//defer atomic.StoreInt32(&rf.appendEntriesRequesting[peer], 0)
 			var reply AppendEntriesReply
-			if rf.sendAppendEntries(peer, args, &reply) {
+			if rf.sendAppendEntries(peer, a, &reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term > rf.currentTerm.Load() {
 					rf.becomeFollower(reply.Term)
+					return
 				}
-				if !rf.workerStatus.Equal(LeaderStatus) || rf.currentTerm.Load() != currentTerm {
-					return // 已经变成 follower 或 term 变了
+				if !rf.workerStatus.Equal(LeaderStatus) || rf.currentTerm.Load() != a.Term {
+					return
 				}
-				// 心跳包的replySuccess不处理
-				if reply.Success && args.AppendArgs.Entries != nil {
-					rf.nextIndex[peer] = nextIndex + len(args.AppendArgs.Entries)
-					rf.matchIndex[peer] = rf.nextIndex[peer] - 1
-					rf.leaderCheckCommitIndex()
-				} else if !reply.Success {
-					//rf.nextIndex[peer] = maxInt(rf.nextIndex[peer]-1, 1)
+
+				if reply.Success {
+					// figure8(unreliable)：新增单调推进，避免旧回复回退 nextIndex
+					newNext := int(sentPrev) + sentCount + 1
+					if rf.nextIndex[peer] < newNext {
+						rf.nextIndex[peer] = newNext
+						rf.matchIndex[peer] = maxInt(rf.matchIndex[peer], newNext-1)
+						rf.leaderCheckCommitIndex()
+						// 取得进展，立刻再发一轮，加快追赶
+						//go rf.sendHeartbeatsAndLogEntries()
+					}
+				} else {
+					// figure8(unreliable)：快速回退resp
+					var candidateNext int
 					if reply.ConflictTerm == -1 {
-						rf.nextIndex[peer] = int(reply.ConflictIndex)
+						candidateNext = int(reply.ConflictIndex)
 					} else {
-						index := rf.nextIndex[peer]
-						// 找到冲突term的最后一个日志索引
-						for index > 0 && rf.logEntries.Find(int64(index-1)).Term == reply.ConflictTerm {
-							index--
+						// 在 leader 日志中找该 term 的最后一次出现
+						last := int(rf.lastLogIndex.Load())
+						j := 0
+						for idx := last; idx > 0; idx-- {
+							if rf.logEntries.Find(int64(idx)).Term == reply.ConflictTerm {
+								j = idx
+								break
+							}
 						}
-						if index > 0 {
-							rf.nextIndex[peer] = int(index)
+						if j > 0 {
+							candidateNext = j + 1
 						} else {
-							rf.nextIndex[peer] = int(reply.ConflictIndex)
+							candidateNext = int(reply.ConflictIndex)
 						}
+					}
+					if candidateNext < rf.nextIndex[peer] {
+						rf.nextIndex[peer] = candidateNext
+						// 产生回退，立刻重发
+						go rf.sendHeartbeatsAndLogEntries()
 					}
 				}
 			}
-		}(i)
+		}(i, args, sentPrev, sentCount)
 	}
+
 	// 重置选举定时器，防止leader心跳过期
 	rf.resetElectionTimer()
 }
@@ -622,8 +677,9 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 // leaderCheckCommitIndex [上层有锁]检查leader的commitIndex
 func (rf *Raft) leaderCheckCommitIndex() {
 	// 3C
+	old := rf.commitIndex.Load()
+	newCommit := old
 	//for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load() &&
-	//	rf.logEntries.Find(N).Term == rf.currentTerm.Load(); N-- {
 	for N := rf.lastLogIndex.Load(); N > rf.commitIndex.Load(); N-- {
 		if rf.logEntries.Find(N).Term != rf.currentTerm.Load() {
 			continue // 跳过，而非退出，之前的日志可能一致
@@ -639,54 +695,60 @@ func (rf *Raft) leaderCheckCommitIndex() {
 		}
 
 		if count > len(rf.peers)/2 {
-			rf.commitIndex.Store(N)
-			break
+			newCommit = N
 		}
 	}
-
-	DPrintf("[LeaderCheckCommitIndex] %d check commitindex %d, lastLogIndex %d", rf.me, rf.commitIndex.Load(), rf.lastLogIndex.Load())
+	if newCommit > old {
+		rf.commitIndex.Store(newCommit)
+		//  figure8(unreliable)：手动触发提交event
+		rf.notifyCommit()
+	}
+	DPrintf("[LeaderCheckCommitIndex] %d commitIndex %d -> %d, lastLogIndex %d", rf.me, old, rf.commitIndex.Load(), rf.lastLogIndex.Load())
 }
 
+// committer figure8(unreliable)：事件驱动 + 定时兜底；一轮内清空新commit
 func (rf *Raft) committer() {
-	commitTimeout := func() time.Duration {
-		return time.Duration(10+rand.Intn(50)) * time.Millisecond
-	}
-
+	commitTimeout := func() time.Duration { return time.Duration(10+rand.Intn(50)) * time.Millisecond }
 	for !rf.killed() {
-		timeout := commitTimeout()
-		timer := time.NewTimer(timeout)
+		timer := time.NewTimer(commitTimeout())
 		select {
 		case <-timer.C:
+			// 退出select，进入commit流程
+		case <-rf.commitNotify:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		}
+		// 尽量在同一轮里把 backlog 都 apply 掉
+		for {
 			rf.mu.Lock()
 			lastApplied := rf.lastApplied.Load()
 			commitIndex := rf.commitIndex.Load()
-			if lastApplied >= commitIndex { // 没有新的日志需要应用
+			if lastApplied >= commitIndex {
 				rf.mu.Unlock()
-				timer.Stop()
-				continue
+				break
 			}
-
 			// 复制需要 apply 的条目到独立切片
 			todo := make(LogEntries, commitIndex-lastApplied)
 			copy(todo, rf.logEntries[lastApplied+1:commitIndex+1])
-
-			// 先别更新 lastApplied；等真正推送完再写
 			rf.mu.Unlock()
 
-			DPrintf("[Committer] %d commit entries from %d to %d, entries %v",
-				rf.me, lastApplied+1, commitIndex, todo)
+			DPrintf("[Committer] %d commit entries from %d to %d", rf.me, lastApplied+1, commitIndex)
 
 			// 应用日志条目到状态机（无锁）
 			for i, entry := range todo {
-				msg := ApplyMsg{
-					CommandValid: true,
-					Command:      entry.Command,
-					CommandIndex: int(lastApplied) + i + 1,
-				}
-				DPrintf("[Apply] %d apply log %v", rf.me, entry)
+				msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: int(lastApplied) + i + 1}
 				rf.applyCh <- msg
 				rf.lastApplied.Add(1)
 			}
 		}
+	}
+}
+
+// 发出一次提交的通知（非阻塞）
+func (rf *Raft) notifyCommit() {
+	select {
+	case rf.commitNotify <- struct{}{}:
+	default:
 	}
 }
