@@ -798,6 +798,7 @@ func (rf *Raft) committer() {
 				break
 			}
 
+			DPrintf("[committer] committer %d, lastApplied %d, commitIndex %d", rf.me, lastApplied, commitIndex)
 			// 计算要 apply 的绝对区间 [startAbs, endAbs]
 			startAbs := lastApplied + 1
 			endAbs := commitIndex
