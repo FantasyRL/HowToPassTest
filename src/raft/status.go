@@ -64,7 +64,7 @@ func (rf *Raft) becomeLeader() {
 					return
 				}
 				rf.sendHeartbeatsAndLogEntries()
-				time.Sleep(30 * time.Millisecond) // 50ms < electionTimeoutMin(300ms)
+				time.Sleep(40 * time.Millisecond) // 50ms < electionTimeoutMin(300ms)
 			}
 		}()
 

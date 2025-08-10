@@ -4,9 +4,16 @@ import "log"
 
 // Debugging
 const Debug = false
+const Debug3D = true
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
+		log.Printf(format, a...)
+	}
+}
+
+func DPrintf3D(format string, a ...interface{}) {
+	if Debug3D {
 		log.Printf(format, a...)
 	}
 }
