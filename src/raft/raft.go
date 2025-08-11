@@ -761,6 +761,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 			}
 			rf.mu.Unlock()
 			go func(peer int, a *InstallSnapshotArgs) {
+				//defer atomic.StoreInt32(&rf.appendEntriesRequesting[peer], 0)
 				var rep InstallSnapshotReply
 				if rf.sendInstallSnapshot(peer, a, &rep) {
 					rf.mu.Lock()
