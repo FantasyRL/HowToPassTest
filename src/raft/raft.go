@@ -685,6 +685,7 @@ func (rf *Raft) startElection() {
 		if i == rf.me {
 			continue
 		}
+		rf.mu.Lock()
 		args := &RequestVoteArgs{
 			Term:        currentTerm,
 			CandidateId: rf.me,
@@ -692,6 +693,7 @@ func (rf *Raft) startElection() {
 			LastLogIndex: rf.lastLogIndex.Load(),       // Candidate最后一条日志记录的索引
 			LastLogTerm:  rf.logEntries.GetLast().Term, // Candidate最后一条日志记录的任期
 		}
+		rf.mu.Unlock()
 
 		go func(peer int) {
 			var reply RequestVoteReply
@@ -759,6 +761,7 @@ func (rf *Raft) sendHeartbeatsAndLogEntries() {
 			}
 			rf.mu.Unlock()
 			go func(peer int, a *InstallSnapshotArgs) {
+				//defer atomic.StoreInt32(&rf.appendEntriesRequesting[peer], 0)
 				var rep InstallSnapshotReply
 				if rf.sendInstallSnapshot(peer, a, &rep) {
 					rf.mu.Lock()
